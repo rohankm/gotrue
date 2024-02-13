@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/mock"
@@ -55,6 +56,11 @@ func TestSmsProvider(t *testing.T) {
 				Textlocal: conf.TextlocalProviderConfiguration{
 					ApiKey: "test_api_key",
 					Sender: "test_sender",
+				},
+				Msg91: conf.Msg91ProviderConfiguration{
+					AuthKey:  "test_auth_key",
+					SenderId: "test_sender_id",
+					// DltTemplateId: "test_dlt_template_id",
 				},
 			},
 		},
@@ -224,6 +230,7 @@ func (ts *SmsProviderTestSuite) TestTextLocalSendSms() {
 	_, err = textlocalProvider.SendSms(phone, message)
 	require.NoError(ts.T(), err)
 }
+
 func (ts *SmsProviderTestSuite) TestTwilioVerifySendSms() {
 	defer gock.Off()
 	provider, err := NewTwilioVerifyProvider(ts.Config.Sms.TwilioVerify)
@@ -284,4 +291,35 @@ func (ts *SmsProviderTestSuite) TestTwilioVerifySendSms() {
 			require.Equal(ts.T(), c.ExpectedError, err)
 		})
 	}
+}
+
+func (ts *SmsProviderTestSuite) TestMsg91SendSms() {
+	defer gock.Off()
+
+	provider, err := NewMsg91Provider(ts.Config.Sms.Msg91)
+	require.NoError(ts.T(), err)
+
+	msg91Provider, _ := provider.(*Msg91Provider)
+
+	phone := "123456789"
+	message := "This is the sms code: 123456"
+
+	body := url.Values{
+		"authkey":  {msg91Provider.Config.AuthKey},
+		"sender":   {msg91Provider.Config.SenderId},
+		"mobiles":  {phone},
+		"message":  {message},
+		"route":    {strconv.Itoa(4)},
+		"response": {"json"},
+	}
+	// if msg91Provider.Config.DltTemplateId != nil && *msg91Provider.Config.DltTemplateId != "" {
+	// 	body.Set("DLT_TE_ID", *msg91Provider.Config.DltTemplateId)
+	// }
+
+	gock.New(msg91Provider.APIPath).Post("").MatchType("url").BodyString(body.Encode()).Reply(200).JSON(Msg91Response{
+		Type: "success",
+	})
+
+	_, err = msg91Provider.SendSms(phone, message)
+	require.NoError(ts.T(), err)
 }
