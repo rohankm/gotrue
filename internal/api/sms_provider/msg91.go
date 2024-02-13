@@ -1,19 +1,20 @@
 package sms_provider
 
 import (
-	"bytes"
+
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
-	"strconv"
 
-	"github.com/supabase/gotrue/internal/conf"
-	"github.com/supabase/gotrue/internal/utilities"
+
+	"strings"  // Add this import for the "strings" package
+	"io" 
+	"github.com/supabase/auth/internal/conf"
+	"github.com/supabase/auth/internal/utilities"
 )
 
 const (
-	defaultMsg91ApiBase = "https://api.msg91.com/api/sendhttp.php"
+	defaultMsg91ApiBase = "https://control.msg91.com/api/v5/flow"
 )
 
 type Msg91Provider struct {
@@ -38,57 +39,57 @@ func NewMsg91Provider(config conf.Msg91ProviderConfiguration) (SmsProvider, erro
 	}, nil
 }
 
-func (t *Msg91Provider) SendMessage(phone string, message string, channel string) (string, error) {
+// SendMessage implements the SmsProvider interface for Msg91Provider.
+func (t *Msg91Provider) SendMessage(phone, message, channel, otp string) (string, error) {
 	switch channel {
 	case SMSProvider:
-		return t.SendSms(phone, message)
+		return t.SendSms(phone, message,otp)
 	default:
 		return "", fmt.Errorf("msg91: channel type %q is not supported", channel)
 	}
 }
 
-func (t *Msg91Provider) SendSms(phone string, message string) (string, error) {
-	body := url.Values{
-		"authkey":  {t.Config.AuthKey},
-		"sender":   {t.Config.SenderId},
-		"mobiles":  {phone},
-		"message":  {message},
-		"route":    {strconv.Itoa(4)},
-		"response": {"json"},
-	}
+func (t *Msg91Provider) SendSms(phone, message, otp string) (string, error) {
+  
 
-	// DLT template ID is only required for Indian users, to comply with
-	// government regulations Indian users have to get their sms template
-	// approved by DLT authorities before using it. DLT template ID is
-	// provided by Authorities after the template is approved.
-	if t.Config.DltTemplateId != nil && *t.Config.DltTemplateId != "" {
-		body.Set("DLT_TE_ID", *t.Config.DltTemplateId)
-	}
+	payload := strings.NewReader(fmt.Sprintf("{\"template_id\":\"%s\",\"recipients\":[{\"mobiles\":\"%s\",\"otp\":\"%s\"}]}", t.Config.TemplateId, phone, otp))
 
-	bodyBuffer := bytes.NewBufferString(body.Encode())
+
 
 	client := &http.Client{Timeout: defaultTimeout}
-	req, err := http.NewRequest(http.MethodPost, t.APIPath, bodyBuffer)
-	if err != nil {
-		return "", fmt.Errorf("msg91 error: unable to create request %w", err)
-	}
 
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+    req, err := http.NewRequest("POST", t.APIPath, payload)
+    if err != nil {
+        return "", fmt.Errorf("msg91 error: unable to create request %w", err)
+    }
 
-	res, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("msg91 error: failed to execute request %w", err)
-	}
-	defer utilities.SafeClose(res.Body)
 
-	var resp Msg91Response
-	if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
-		return "", fmt.Errorf("msg91 error: failed to parse JSON response body (status code %v): %w", res.StatusCode, err)
-	}
+	req.Header.Add("accept", "application/json")
+    req.Header.Add("content-type", "application/json")
+    req.Header.Add("authkey", t.Config.AuthKey)
 
-	if resp.Type != "success" {
-		return resp.Message, fmt.Errorf("msg91 error: expected \"success\" but got %q with message %q (code: %v)", resp.Type, resp.Message, res.StatusCode)
-	}
+    res, err := client.Do(req)
+    if err != nil {
+        return "", fmt.Errorf("msg91 error: failed to execute request %w", err)
+    }
+    defer utilities.SafeClose(res.Body)
 
-	return resp.Message, nil
+    body, err := io.ReadAll(res.Body)
+    if err != nil {
+        return "", fmt.Errorf("msg91 error: failed to read response body: %w", err)
+    }
+
+    fmt.Println(string(body)) // Assuming you want to print the response body
+
+    var resp Msg91Response
+    if err := json.Unmarshal(body, &resp); err != nil {
+        return "", fmt.Errorf("msg91 error: failed to unmarshal JSON response body (status code %v): %w", res.StatusCode, err)
+    }
+
+    if resp.Type != "success" {
+        return resp.Message, fmt.Errorf("msg91 error: expected \"success\" but got %q with message %q (code: %v)", resp.Type, resp.Message, res.StatusCode)
+    }
+
+    return resp.Message, nil
 }
+
