@@ -18,9 +18,18 @@ import (
 
 const defaultMinPasswordLength int = 6
 const defaultChallengeExpiryDuration float64 = 300
+const defaultFactorExpiryDuration time.Duration = 300 * time.Second
 const defaultFlowStateExpiryDuration time.Duration = 300 * time.Second
 
+// See: https://www.postgresql.org/docs/7.0/syntax525.htm
 var postgresNamesRegexp = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]{0,62}$`)
+
+// See: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+// We use 4 * Math.ceil(n/3) to obtain unpadded length in base 64
+// So this 4 * Math.ceil(24/3) = 32 and 4 * Math.ceil(64/3) = 88 for symmetric secrets
+// Since Ed25519 key is 32 bytes so we have 4 * Math.ceil(32/3) = 44
+var symmetricSecretFormat = regexp.MustCompile(`^v1,whsec_[A-Za-z0-9+/=]{32,88}`)
+var asymmetricSecretFormat = regexp.MustCompile(`^v1a,whpk_[A-Za-z0-9+/=]{44,}:whsk_[A-Za-z0-9+/=]{44,}$`)
 
 // Time is used to represent timestamps in the configuration, as envconfig has
 // trouble parsing empty strings, due to time.Time.UnmarshalText().
@@ -51,6 +60,10 @@ type OAuthProviderConfiguration struct {
 	ApiURL         string   `json:"api_url" split_words:"true"`
 	Enabled        bool     `json:"enabled"`
 	SkipNonceCheck bool     `json:"skip_nonce_check" split_words:"true"`
+}
+
+type AnonymousProviderConfiguration struct {
+	Enabled bool `json:"enabled" default:"false"`
 }
 
 type EmailProviderConfiguration struct {
@@ -90,11 +103,12 @@ type JWTConfiguration struct {
 
 // MFAConfiguration holds all the MFA related Configuration
 type MFAConfiguration struct {
-	Enabled                     bool    `default:"false"`
-	ChallengeExpiryDuration     float64 `json:"challenge_expiry_duration" default:"300" split_words:"true"`
-	RateLimitChallengeAndVerify float64 `split_words:"true" default:"15"`
-	MaxEnrolledFactors          float64 `split_words:"true" default:"10"`
-	MaxVerifiedFactors          int     `split_words:"true" default:"10"`
+	Enabled                     bool          `default:"false"`
+	ChallengeExpiryDuration     float64       `json:"challenge_expiry_duration" default:"300" split_words:"true"`
+	FactorExpiryDuration        time.Duration `json:"factor_expiry_duration" default:"300s" split_words:"true"`
+	RateLimitChallengeAndVerify float64       `split_words:"true" default:"15"`
+	MaxEnrolledFactors          float64       `split_words:"true" default:"10"`
+	MaxVerifiedFactors          int           `split_words:"true" default:"10"`
 }
 
 type APIConfiguration struct {
@@ -191,21 +205,22 @@ type PasswordConfiguration struct {
 
 // GlobalConfiguration holds all the configuration that applies to all instances.
 type GlobalConfiguration struct {
-	API                   APIConfiguration
-	DB                    DBConfiguration
-	External              ProviderConfiguration
-	Logging               LoggingConfig  `envconfig:"LOG"`
-	Profiler              ProfilerConfig `envconfig:"PROFILER"`
-	OperatorToken         string         `split_words:"true" required:"false"`
-	Tracing               TracingConfig
-	Metrics               MetricsConfig
-	SMTP                  SMTPConfiguration
-	RateLimitHeader       string  `split_words:"true"`
-	RateLimitEmailSent    float64 `split_words:"true" default:"30"`
-	RateLimitSmsSent      float64 `split_words:"true" default:"30"`
-	RateLimitVerify       float64 `split_words:"true" default:"30"`
-	RateLimitTokenRefresh float64 `split_words:"true" default:"150"`
-	RateLimitSso          float64 `split_words:"true" default:"30"`
+	API                     APIConfiguration
+	DB                      DBConfiguration
+	External                ProviderConfiguration
+	Logging                 LoggingConfig  `envconfig:"LOG"`
+	Profiler                ProfilerConfig `envconfig:"PROFILER"`
+	OperatorToken           string         `split_words:"true" required:"false"`
+	Tracing                 TracingConfig
+	Metrics                 MetricsConfig
+	SMTP                    SMTPConfiguration
+	RateLimitHeader         string  `split_words:"true"`
+	RateLimitEmailSent      float64 `split_words:"true" default:"30"`
+	RateLimitSmsSent        float64 `split_words:"true" default:"30"`
+	RateLimitVerify         float64 `split_words:"true" default:"30"`
+	RateLimitTokenRefresh   float64 `split_words:"true" default:"150"`
+	RateLimitSso            float64 `split_words:"true" default:"30"`
+	RateLimitAnonymousUsers float64 `split_words:"true" default:"30"`
 
 	SiteURL         string   `json:"site_url" split_words:"true" required:"true"`
 	URIAllowList    []string `json:"uri_allow_list" split_words:"true"`
@@ -215,7 +230,6 @@ type GlobalConfiguration struct {
 	Mailer          MailerConfiguration      `json:"mailer"`
 	Sms             SmsProviderConfiguration `json:"sms"`
 	DisableSignup   bool                     `json:"disable_signup" split_words:"true"`
-	Webhook         WebhookConfig            `json:"webhook" split_words:"true"`
 	Hook            HookConfiguration        `json:"hook" split_words:"true"`
 	Security        SecurityConfiguration    `json:"security"`
 	Sessions        SessionsConfiguration    `json:"sessions"`
@@ -264,33 +278,34 @@ type EmailContentConfiguration struct {
 }
 
 type ProviderConfiguration struct {
-	Apple                   OAuthProviderConfiguration `json:"apple"`
-	Azure                   OAuthProviderConfiguration `json:"azure"`
-	Bitbucket               OAuthProviderConfiguration `json:"bitbucket"`
-	Discord                 OAuthProviderConfiguration `json:"discord"`
-	Facebook                OAuthProviderConfiguration `json:"facebook"`
-	Figma                   OAuthProviderConfiguration `json:"figma"`
-	Fly                     OAuthProviderConfiguration `json:"fly"`
-	Github                  OAuthProviderConfiguration `json:"github"`
-	Gitlab                  OAuthProviderConfiguration `json:"gitlab"`
-	Google                  OAuthProviderConfiguration `json:"google"`
-	Kakao                   OAuthProviderConfiguration `json:"kakao"`
-	Notion                  OAuthProviderConfiguration `json:"notion"`
-	Keycloak                OAuthProviderConfiguration `json:"keycloak"`
-	Linkedin                OAuthProviderConfiguration `json:"linkedin"`
-	LinkedinOIDC            OAuthProviderConfiguration `json:"linkedin_oidc" envconfig:"LINKEDIN_OIDC"`
-	Spotify                 OAuthProviderConfiguration `json:"spotify"`
-	Slack                   OAuthProviderConfiguration `json:"slack"`
-	Twitter                 OAuthProviderConfiguration `json:"twitter"`
-	Twitch                  OAuthProviderConfiguration `json:"twitch"`
-	WorkOS                  OAuthProviderConfiguration `json:"workos"`
-	Email                   EmailProviderConfiguration `json:"email"`
-	Phone                   PhoneProviderConfiguration `json:"phone"`
-	Zoom                    OAuthProviderConfiguration `json:"zoom"`
-	IosBundleId             string                     `json:"ios_bundle_id" split_words:"true"`
-	RedirectURL             string                     `json:"redirect_url"`
-	AllowedIdTokenIssuers   []string                   `json:"allowed_id_token_issuers" split_words:"true"`
-	FlowStateExpiryDuration time.Duration              `json:"flow_state_expiry_duration" split_words:"true"`
+	AnonymousUsers          AnonymousProviderConfiguration `json:"anonymous_users" split_words:"true"`
+	Apple                   OAuthProviderConfiguration     `json:"apple"`
+	Azure                   OAuthProviderConfiguration     `json:"azure"`
+	Bitbucket               OAuthProviderConfiguration     `json:"bitbucket"`
+	Discord                 OAuthProviderConfiguration     `json:"discord"`
+	Facebook                OAuthProviderConfiguration     `json:"facebook"`
+	Figma                   OAuthProviderConfiguration     `json:"figma"`
+	Fly                     OAuthProviderConfiguration     `json:"fly"`
+	Github                  OAuthProviderConfiguration     `json:"github"`
+	Gitlab                  OAuthProviderConfiguration     `json:"gitlab"`
+	Google                  OAuthProviderConfiguration     `json:"google"`
+	Kakao                   OAuthProviderConfiguration     `json:"kakao"`
+	Notion                  OAuthProviderConfiguration     `json:"notion"`
+	Keycloak                OAuthProviderConfiguration     `json:"keycloak"`
+	Linkedin                OAuthProviderConfiguration     `json:"linkedin"`
+	LinkedinOIDC            OAuthProviderConfiguration     `json:"linkedin_oidc" envconfig:"LINKEDIN_OIDC"`
+	Spotify                 OAuthProviderConfiguration     `json:"spotify"`
+	Slack                   OAuthProviderConfiguration     `json:"slack"`
+	Twitter                 OAuthProviderConfiguration     `json:"twitter"`
+	Twitch                  OAuthProviderConfiguration     `json:"twitch"`
+	WorkOS                  OAuthProviderConfiguration     `json:"workos"`
+	Email                   EmailProviderConfiguration     `json:"email"`
+	Phone                   PhoneProviderConfiguration     `json:"phone"`
+	Zoom                    OAuthProviderConfiguration     `json:"zoom"`
+	IosBundleId             string                         `json:"ios_bundle_id" split_words:"true"`
+	RedirectURL             string                         `json:"redirect_url"`
+	AllowedIdTokenIssuers   []string                       `json:"allowed_id_token_issuers" split_words:"true"`
+	FlowStateExpiryDuration time.Duration                  `json:"flow_state_expiry_duration" split_words:"true"`
 }
 
 type SMTPConfiguration struct {
@@ -437,25 +452,33 @@ func loadEnvironment(filename string) error {
 	return err
 }
 
-type WebhookConfig struct {
-	URL        string   `json:"url"`
-	Retries    int      `json:"retries"`
-	TimeoutSec int      `json:"timeout_sec"`
-	Secret     string   `json:"secret"`
-	Events     []string `json:"events"`
-}
-
 // Moving away from the existing HookConfig so we can get a fresh start.
 type HookConfiguration struct {
 	MFAVerificationAttempt      ExtensibilityPointConfiguration `json:"mfa_verification_attempt" split_words:"true"`
 	PasswordVerificationAttempt ExtensibilityPointConfiguration `json:"password_verification_attempt" split_words:"true"`
 	CustomAccessToken           ExtensibilityPointConfiguration `json:"custom_access_token" split_words:"true"`
+	CustomSMSProvider           ExtensibilityPointConfiguration `json:"custom_sms_provider" split_words:"true"`
+}
+
+type HTTPHookSecrets []string
+
+func (h *HTTPHookSecrets) Decode(value string) error {
+	parts := strings.Split(value, "|")
+	for _, part := range parts {
+		if part != "" {
+			*h = append(*h, part)
+		}
+	}
+
+	return nil
 }
 
 type ExtensibilityPointConfiguration struct {
 	URI      string `json:"uri"`
 	Enabled  bool   `json:"enabled"`
 	HookName string `json:"hook_name"`
+	// We use | as a separator for keys and : as a separator for keys within a keypair. For instance: v1,whsec_test|v1a,whpk_myother:v1a,whsk_testkey|v1,whsec_secret3
+	HTTPHookSecrets []string `json:"secrets" envconfig:"secrets"`
 }
 
 func (h *HookConfiguration) Validate() error {
@@ -463,6 +486,7 @@ func (h *HookConfiguration) Validate() error {
 		h.MFAVerificationAttempt,
 		h.PasswordVerificationAttempt,
 		h.CustomAccessToken,
+		h.CustomSMSProvider,
 	}
 	for _, point := range points {
 		if err := point.ValidateExtensibilityPoint(); err != nil {
@@ -473,26 +497,55 @@ func (h *HookConfiguration) Validate() error {
 }
 
 func (e *ExtensibilityPointConfiguration) ValidateExtensibilityPoint() error {
-	if e.URI != "" {
-		u, err := url.Parse(e.URI)
-		if err != nil {
-			return err
+	if e.URI == "" {
+		return nil
+	}
+	u, err := url.Parse(e.URI)
+	if err != nil {
+		return err
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "pg-functions":
+		return validatePostgresPath(u)
+	case "http":
+		hostname := u.Hostname()
+		if hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" {
+			return validateHTTPSHookSecrets(e.HTTPHookSecrets)
 		}
-		pathParts := strings.Split(u.Path, "/")
-		if len(pathParts) < 3 {
-			return fmt.Errorf("URI path does not contain enough parts")
-		}
-		if u.Scheme != "pg-functions" {
-			return fmt.Errorf("only postgres hooks are supported at the moment")
-		}
-		schema := pathParts[1]
-		table := pathParts[2]
-		// Validate schema and table names
-		if !postgresNamesRegexp.MatchString(schema) {
-			return fmt.Errorf("invalid schema name: %s", schema)
-		}
-		if !postgresNamesRegexp.MatchString(table) {
-			return fmt.Errorf("invalid table name: %s", table)
+		return fmt.Errorf("only localhost, 127.0.0.1, and ::1 are supported with http")
+	case "https":
+		return validateHTTPSHookSecrets(e.HTTPHookSecrets)
+	default:
+		return fmt.Errorf("only postgres hooks and HTTPS functions are supported at the moment")
+	}
+}
+
+func validatePostgresPath(u *url.URL) error {
+	pathParts := strings.Split(u.Path, "/")
+	if len(pathParts) < 3 {
+		return fmt.Errorf("URI path does not contain enough parts")
+	}
+
+	schema := pathParts[1]
+	table := pathParts[2]
+	// Validate schema and table names
+	if !postgresNamesRegexp.MatchString(schema) {
+		return fmt.Errorf("invalid schema name: %s", schema)
+	}
+	if !postgresNamesRegexp.MatchString(table) {
+		return fmt.Errorf("invalid table name: %s", table)
+	}
+	return nil
+}
+
+func isValidSecretFormat(secret string) bool {
+	return symmetricSecretFormat.MatchString(secret) || asymmetricSecretFormat.MatchString(secret)
+}
+
+func validateHTTPSHookSecrets(secrets []string) error {
+	for _, secret := range secrets {
+		if !isValidSecretFormat(secret) {
+			return fmt.Errorf("invalid secret format")
 		}
 	}
 	return nil
@@ -509,15 +562,6 @@ func (e *ExtensibilityPointConfiguration) PopulateExtensibilityPoint() error {
 	pathParts := strings.Split(u.Path, "/")
 	e.HookName = fmt.Sprintf("%q.%q", pathParts[1], pathParts[2])
 	return nil
-}
-
-func (w *WebhookConfig) HasEvent(event string) bool {
-	for _, name := range w.Events {
-		if event == name {
-			return true
-		}
-	}
-	return false
 }
 
 func LoadGlobal(filename string) (*GlobalConfiguration, error) {
@@ -541,8 +585,14 @@ func LoadGlobal(filename string) (*GlobalConfiguration, error) {
 		return nil, err
 	}
 
-	if config.Hook.CustomAccessToken.Enabled {
-		if err := config.Hook.CustomAccessToken.PopulateExtensibilityPoint(); err != nil {
+	if config.Hook.PasswordVerificationAttempt.Enabled {
+		if err := config.Hook.PasswordVerificationAttempt.PopulateExtensibilityPoint(); err != nil {
+			return nil, err
+		}
+	}
+
+	if config.Hook.CustomSMSProvider.Enabled {
+		if err := config.Hook.CustomSMSProvider.PopulateExtensibilityPoint(); err != nil {
 			return nil, err
 		}
 	}
@@ -674,6 +724,9 @@ func (config *GlobalConfiguration) ApplyDefaults() error {
 	}
 	if config.MFA.ChallengeExpiryDuration < defaultChallengeExpiryDuration {
 		config.MFA.ChallengeExpiryDuration = defaultChallengeExpiryDuration
+	}
+	if config.MFA.FactorExpiryDuration < defaultFactorExpiryDuration {
+		config.MFA.FactorExpiryDuration = defaultFactorExpiryDuration
 	}
 	if config.External.FlowStateExpiryDuration < defaultFlowStateExpiryDuration {
 		config.External.FlowStateExpiryDuration = defaultFlowStateExpiryDuration

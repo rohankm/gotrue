@@ -197,6 +197,13 @@ func (ts *UserTestSuite) TestUserUpdatePhoneAutoconfirmEnabled() {
 			w := httptest.NewRecorder()
 			ts.API.handler.ServeHTTP(w, req)
 			require.Equal(ts.T(), c.expectedCode, w.Code)
+
+			if c.expectedCode == http.StatusOK {
+				// check that the user response returned contains the updated phone field
+				data := &models.User{}
+				require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&data))
+				require.Equal(ts.T(), data.GetPhone(), c.userData["phone"])
+			}
 		})
 	}
 
@@ -274,7 +281,7 @@ func (ts *UserTestSuite) TestUserUpdatePassword() {
 			nonce:                   "123456",
 			requireReauthentication: true,
 			sessionId:               nil,
-			expected:                expected{code: http.StatusBadRequest, isAuthenticated: false},
+			expected:                expected{code: http.StatusUnprocessableEntity, isAuthenticated: false},
 		},
 		{
 			desc:                    "Valid password length",
@@ -364,7 +371,7 @@ func (ts *UserTestSuite) TestUserUpdatePasswordReauthentication() {
 
 	require.True(ts.T(), u.Authenticate(context.Background(), "newpass"))
 	require.Empty(ts.T(), u.ReauthenticationToken)
-	require.NotEmpty(ts.T(), u.ReauthenticationSentAt)
+	require.Nil(ts.T(), u.ReauthenticationSentAt)
 }
 
 func (ts *UserTestSuite) TestUserUpdatePasswordLogoutOtherSessions() {

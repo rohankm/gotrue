@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"github.com/fatih/structs"
@@ -24,16 +23,11 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) error {
 	config := a.config
 	adminUser := getAdminUser(ctx)
 	params := &InviteParams{}
-
-	body, err := getBodyBytes(r)
-	if err != nil {
-		return badRequestError("Could not read body").WithInternalError(err)
+	if err := retrieveRequestParams(r, params); err != nil {
+		return err
 	}
 
-	if err := json.Unmarshal(body, params); err != nil {
-		return badRequestError("Could not read Invite params: %v", err)
-	}
-
+	var err error
 	params.Email, err = validateEmail(params.Email)
 	if err != nil {
 		return err
@@ -48,7 +42,7 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) error {
 	err = db.Transaction(func(tx *storage.Connection) error {
 		if user != nil {
 			if user.IsConfirmed() {
-				return unprocessableEntityError(DuplicateEmailMsg)
+				return unprocessableEntityError(ErrorCodeEmailExists, DuplicateEmailMsg)
 			}
 		} else {
 			signupParams := SignupParams{
@@ -66,7 +60,7 @@ func (a *API) Invite(w http.ResponseWriter, r *http.Request) error {
 				return err
 			}
 
-			user, err = a.signupNewUser(ctx, tx, user)
+			user, err = a.signupNewUser(tx, user)
 			if err != nil {
 				return err
 			}

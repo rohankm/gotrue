@@ -17,7 +17,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        
+
       - id: meta
         uses: docker/metadata-action@v4
         with:
@@ -34,7 +34,7 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=semver,pattern={{version}},value=${{ inputs.version }},enable=true
+            type=raw,value=v${{ inputs.version }},enable=true
 
       - uses: docker/setup-qemu-action@v2
         with:

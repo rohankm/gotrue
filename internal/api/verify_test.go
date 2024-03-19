@@ -280,9 +280,9 @@ func (ts *VerifyTestSuite) TestExpiredConfirmationToken() {
 
 	f, err := url.ParseQuery(rurl.Fragment)
 	require.NoError(ts.T(), err)
-	assert.Equal(ts.T(), "401", f.Get("error_code"))
+	assert.Equal(ts.T(), "403", f.Get("error_code"))
 	assert.Equal(ts.T(), "Email link is invalid or has expired", f.Get("error_description"))
-	assert.Equal(ts.T(), "unauthorized_client", f.Get("error"))
+	assert.Equal(ts.T(), "access_denied", f.Get("error"))
 }
 
 func (ts *VerifyTestSuite) TestInvalidOtp() {
@@ -302,7 +302,7 @@ func (ts *VerifyTestSuite) TestInvalidOtp() {
 	}
 
 	expectedResponse := ResponseBody{
-		Code: http.StatusUnauthorized,
+		Code: http.StatusForbidden,
 		Msg:  "Token has expired or is invalid",
 	}
 
@@ -313,7 +313,7 @@ func (ts *VerifyTestSuite) TestInvalidOtp() {
 		expected ResponseBody
 	}{
 		{
-			desc:     "Expired Sms OTP",
+			desc:     "Expired SMS OTP",
 			sentTime: time.Now().Add(-48 * time.Hour),
 			body: map[string]interface{}{
 				"type":  smsVerification,
@@ -323,7 +323,7 @@ func (ts *VerifyTestSuite) TestInvalidOtp() {
 			expected: expectedResponse,
 		},
 		{
-			desc:     "Invalid Sms OTP",
+			desc:     "Invalid SMS OTP",
 			sentTime: time.Now(),
 			body: map[string]interface{}{
 				"type":  smsVerification,
@@ -661,8 +661,8 @@ func (ts *VerifyTestSuite) TestVerifyPKCEOTP() {
 			var buffer bytes.Buffer
 			require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(c.payload))
 			codeChallenge := "codechallengecodechallengcodechallengcodechallengcodechallenge" + c.payload.Type
-			err := models.NewFlowStateWithUserID(ts.API.db, c.authenticationMethod.String(), codeChallenge, models.SHA256, c.authenticationMethod, &u.ID)
-			require.NoError(ts.T(), err)
+			flowState := models.NewFlowState(c.authenticationMethod.String(), codeChallenge, models.SHA256, c.authenticationMethod, &u.ID)
+			require.NoError(ts.T(), ts.API.db.Create(flowState))
 
 			requestUrl := fmt.Sprintf("http://localhost/verify?type=%v&token=%v", c.payload.Type, c.payload.Token)
 			req := httptest.NewRequest(http.MethodGet, requestUrl, &buffer)
@@ -760,7 +760,7 @@ func (ts *VerifyTestSuite) TestVerifyBannedUser() {
 
 			f, err := url.ParseQuery(rurl.Fragment)
 			require.NoError(ts.T(), err)
-			assert.Equal(ts.T(), "401", f.Get("error_code"))
+			assert.Equal(ts.T(), "403", f.Get("error_code"))
 		})
 	}
 }
@@ -973,7 +973,7 @@ func (ts *VerifyTestSuite) TestSecureEmailChangeWithTokenHash() {
 				"type":       emailChangeVerification,
 				"token_hash": currentEmailChangeToken,
 			},
-			expectedStatus: http.StatusUnauthorized,
+			expectedStatus: http.StatusForbidden,
 		},
 	}
 	for _, c := range cases {
@@ -1101,9 +1101,8 @@ func (ts *VerifyTestSuite) TestPrepErrorRedirectURL() {
 	}
 	for _, c := range cases {
 		ts.Run(c.desc, func() {
-			w := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodGet, "http://localhost", nil)
-			rurl, err := ts.API.prepErrorRedirectURL(badRequestError(DefaultError), w, req, c.rurl, c.flowType)
+			rurl, err := ts.API.prepErrorRedirectURL(badRequestError(ErrorCodeValidationFailed, DefaultError), req, c.rurl, c.flowType)
 			require.NoError(ts.T(), err)
 			require.Equal(ts.T(), c.expected, rurl)
 		})
@@ -1153,7 +1152,7 @@ func (ts *VerifyTestSuite) TestVerifyValidateParams() {
 				Token: "some-token",
 			},
 			method:   http.MethodPost,
-			expected: badRequestError("Only an email address or phone number should be provided on verify"),
+			expected: badRequestError(ErrorCodeValidationFailed, "Only an email address or phone number should be provided on verify"),
 		},
 		{
 			desc: "Cannot send both TokenHash and Token",
@@ -1163,7 +1162,7 @@ func (ts *VerifyTestSuite) TestVerifyValidateParams() {
 				TokenHash: "some-token-hash",
 			},
 			method:   http.MethodPost,
-			expected: badRequestError("Verify requires either a token or a token hash"),
+			expected: badRequestError(ErrorCodeValidationFailed, "Verify requires either a token or a token hash"),
 		},
 		{
 			desc: "No verification type specified",
@@ -1172,7 +1171,7 @@ func (ts *VerifyTestSuite) TestVerifyValidateParams() {
 				Email: "email@example.com",
 			},
 			method:   http.MethodPost,
-			expected: badRequestError("Verify requires a verification type"),
+			expected: badRequestError(ErrorCodeValidationFailed, "Verify requires a verification type"),
 		},
 	}
 

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -26,22 +25,22 @@ func (p *ResendConfirmationParams) Validate(config *conf.GlobalConfiguration) er
 		break
 	default:
 		// type does not match one of the above
-		return badRequestError("Missing one of these types: signup, email_change, sms, phone_change")
+		return badRequestError(ErrorCodeValidationFailed, "Missing one of these types: signup, email_change, sms, phone_change")
 
 	}
 	if p.Email == "" && p.Type == signupVerification {
-		return badRequestError("Type provided requires an email address")
+		return badRequestError(ErrorCodeValidationFailed, "Type provided requires an email address")
 	}
 	if p.Phone == "" && p.Type == smsVerification {
-		return badRequestError("Type provided requires a phone number")
+		return badRequestError(ErrorCodeValidationFailed, "Type provided requires a phone number")
 	}
 
 	var err error
 	if p.Email != "" && p.Phone != "" {
-		return badRequestError("Only an email address or phone number should be provided.")
+		return badRequestError(ErrorCodeValidationFailed, "Only an email address or phone number should be provided.")
 	} else if p.Email != "" {
 		if !config.External.Email.Enabled {
-			return badRequestError("Email logins are disabled")
+			return badRequestError(ErrorCodeEmailProviderDisabled, "Email logins are disabled")
 		}
 		p.Email, err = validateEmail(p.Email)
 		if err != nil {
@@ -49,7 +48,7 @@ func (p *ResendConfirmationParams) Validate(config *conf.GlobalConfiguration) er
 		}
 	} else if p.Phone != "" {
 		if !config.External.Phone.Enabled {
-			return badRequestError("Phone logins are disabled")
+			return badRequestError(ErrorCodePhoneProviderDisabled, "Phone logins are disabled")
 		}
 		p.Phone, err = validatePhone(p.Phone)
 		if err != nil {
@@ -57,7 +56,7 @@ func (p *ResendConfirmationParams) Validate(config *conf.GlobalConfiguration) er
 		}
 	} else {
 		// both email and phone are empty
-		return badRequestError("Missing email address or phone number")
+		return badRequestError(ErrorCodeValidationFailed, "Missing email address or phone number")
 	}
 	return nil
 }
@@ -68,14 +67,8 @@ func (a *API) Resend(w http.ResponseWriter, r *http.Request) error {
 	db := a.db.WithContext(ctx)
 	config := a.config
 	params := &ResendConfirmationParams{}
-
-	body, err := getBodyBytes(r)
-	if err != nil {
-		return badRequestError("Could not read body").WithInternalError(err)
-	}
-
-	if err := json.Unmarshal(body, params); err != nil {
-		return badRequestError("Could not read params: %v", err)
+	if err := retrieveRequestParams(r, params); err != nil {
+		return err
 	}
 
 	if err := params.Validate(config); err != nil {
@@ -83,6 +76,7 @@ func (a *API) Resend(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	var user *models.User
+	var err error
 	aud := a.requestAud(ctx, r)
 	if params.Email != "" {
 		user, err = models.FindUserByEmailAndAudience(db, params.Email, aud)
@@ -140,7 +134,7 @@ func (a *API) Resend(w http.ResponseWriter, r *http.Request) error {
 			if terr != nil {
 				return terr
 			}
-			mID, terr := a.sendPhoneConfirmation(ctx, tx, user, params.Phone, phoneConfirmationOtp, smsProvider, sms_provider.SMSProvider)
+			mID, terr := a.sendPhoneConfirmation(tx, user, params.Phone, phoneConfirmationOtp, smsProvider, sms_provider.SMSProvider)
 			if terr != nil {
 				return terr
 			}
@@ -152,7 +146,7 @@ func (a *API) Resend(w http.ResponseWriter, r *http.Request) error {
 			if terr != nil {
 				return terr
 			}
-			mID, terr := a.sendPhoneConfirmation(ctx, tx, user, user.PhoneChange, phoneChangeVerification, smsProvider, sms_provider.SMSProvider)
+			mID, terr := a.sendPhoneConfirmation(tx, user, user.PhoneChange, phoneChangeVerification, smsProvider, sms_provider.SMSProvider)
 			if terr != nil {
 				return terr
 			}
@@ -162,8 +156,13 @@ func (a *API) Resend(w http.ResponseWriter, r *http.Request) error {
 	})
 	if err != nil {
 		if errors.Is(err, MaxFrequencyLimitError) {
+			reason := ErrorCodeOverEmailSendRateLimit
+			if params.Type == smsVerification || params.Type == phoneChangeVerification {
+				reason = ErrorCodeOverSMSSendRateLimit
+			}
+
 			until := time.Until(user.ConfirmationSentAt.Add(config.SMTP.MaxFrequency)) / time.Second
-			return tooManyRequestsError("For security purposes, you can only request this once every %d seconds.", until)
+			return tooManyRequestsError(reason, "For security purposes, you can only request this once every %d seconds.", until)
 		}
 		return internalServerError("Unable to process request").WithInternalError(err)
 	}

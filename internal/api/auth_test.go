@@ -75,9 +75,8 @@ func (ts *AuthTestSuite) TestMaybeLoadUserOrSession() {
 	u, err := models.FindUserByEmailAndAudience(ts.API.db, "test@example.com", ts.Config.JWT.Aud)
 	require.NoError(ts.T(), err)
 
-	s, err := models.NewSession()
+	s, err := models.NewSession(u.ID, nil)
 	require.NoError(ts.T(), err)
-	s.UserID = u.ID
 	require.NoError(ts.T(), ts.API.db.Create(s))
 
 	require.NoError(ts.T(), ts.API.db.Load(s))
@@ -97,7 +96,7 @@ func (ts *AuthTestSuite) TestMaybeLoadUserOrSession() {
 				},
 				Role: "authenticated",
 			},
-			ExpectedError: unauthorizedError("invalid claim: missing sub claim"),
+			ExpectedError: forbiddenError(ErrorCodeBadJWT, "invalid claim: missing sub claim"),
 			ExpectedUser:  nil,
 		},
 		{
@@ -119,7 +118,7 @@ func (ts *AuthTestSuite) TestMaybeLoadUserOrSession() {
 				},
 				Role: "authenticated",
 			},
-			ExpectedError: badRequestError("invalid claim: sub claim must be a UUID"),
+			ExpectedError: badRequestError(ErrorCodeBadJWT, "invalid claim: sub claim must be a UUID"),
 			ExpectedUser:  nil,
 		},
 		{

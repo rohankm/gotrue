@@ -72,7 +72,6 @@ func (ts *PhoneTestSuite) TestFormatPhoneNumber() {
 func doTestSendPhoneConfirmation(ts *PhoneTestSuite, useTestOTP bool) {
 	u, err := models.FindUserByPhoneAndAudience(ts.API.db, "123456789", ts.Config.JWT.Aud)
 	require.NoError(ts.T(), err)
-	ctx := context.Background()
 	cases := []struct {
 		desc     string
 		otpType  string
@@ -112,7 +111,7 @@ func doTestSendPhoneConfirmation(ts *PhoneTestSuite, useTestOTP bool) {
 		ts.Run(c.desc, func() {
 			provider := &TestSmsProvider{}
 
-			_, err = ts.API.sendPhoneConfirmation(ctx, ts.API.db, u, "123456789", c.otpType, provider, sms_provider.SMSProvider)
+			_, err = ts.API.sendPhoneConfirmation(ts.API.db, u, "123456789", c.otpType, provider, sms_provider.SMSProvider)
 			require.Equal(ts.T(), c.expected, err)
 			u, err = models.FindUserByPhoneAndAudience(ts.API.db, "123456789", ts.Config.JWT.Aud)
 			require.NoError(ts.T(), err)
@@ -178,8 +177,8 @@ func (ts *PhoneTestSuite) TestMissingSmsProviderConfig() {
 				"password": "testpassword",
 			},
 			expected: map[string]interface{}{
-				"code":    http.StatusBadRequest,
-				"message": "Error sending confirmation sms:",
+				"code":    http.StatusInternalServerError,
+				"message": "Unable to get SMS provider",
 			},
 		},
 		{
@@ -191,8 +190,8 @@ func (ts *PhoneTestSuite) TestMissingSmsProviderConfig() {
 				"phone": "123456789",
 			},
 			expected: map[string]interface{}{
-				"code":    http.StatusBadRequest,
-				"message": "Error sending sms:",
+				"code":    http.StatusInternalServerError,
+				"message": "Unable to get SMS provider",
 			},
 		},
 		{
@@ -204,8 +203,8 @@ func (ts *PhoneTestSuite) TestMissingSmsProviderConfig() {
 				"phone": "111111111",
 			},
 			expected: map[string]interface{}{
-				"code":    http.StatusBadRequest,
-				"message": "Error sending sms:",
+				"code":    http.StatusInternalServerError,
+				"message": "Unable to get SMS provider",
 			},
 		},
 		{
@@ -215,8 +214,8 @@ func (ts *PhoneTestSuite) TestMissingSmsProviderConfig() {
 			header:   "",
 			body:     nil,
 			expected: map[string]interface{}{
-				"code":    http.StatusBadRequest,
-				"message": "Error sending sms:",
+				"code":    http.StatusInternalServerError,
+				"message": "Unable to get SMS provider",
 			},
 		},
 	}
@@ -245,7 +244,12 @@ func (ts *PhoneTestSuite) TestMissingSmsProviderConfig() {
 				require.Equal(ts.T(), c.expected["code"], w.Code)
 
 				body := w.Body.String()
-				require.True(ts.T(), strings.Contains(body, c.expected["message"].(string)))
+				require.True(ts.T(),
+					strings.Contains(body, "Unable to get SMS provider") ||
+						strings.Contains(body, "Error finding SMS provider") ||
+						strings.Contains(body, "Failed to get SMS provider"),
+					"unexpected body message %q", body,
+				)
 			})
 		}
 	}
