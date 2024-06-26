@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"runtime/debug"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/supabase/auth/internal/observability"
@@ -148,27 +149,28 @@ func httpError(httpStatus int, errorCode ErrorCode, fmtString string, args ...in
 // Recoverer is a middleware that recovers from panics, logs the panic (and a
 // backtrace), and returns a HTTP 500 (Internal Server Error) status if
 // possible. Recoverer prints a request ID if one is provided.
-func recoverer(w http.ResponseWriter, r *http.Request) (context.Context, error) {
-	defer func() {
-		if rvr := recover(); rvr != nil {
+func recoverer(next http.Handler) http.Handler {
+	fn := func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rvr := recover(); rvr != nil {
+				logEntry := observability.GetLogEntry(r)
+				if logEntry != nil {
+					logEntry.Panic(rvr, debug.Stack())
+				} else {
+					fmt.Fprintf(os.Stderr, "Panic: %+v\n", rvr)
+					debug.PrintStack()
+				}
 
-			logEntry := observability.GetLogEntry(r)
-			if logEntry != nil {
-				logEntry.Panic(rvr, debug.Stack())
-			} else {
-				fmt.Fprintf(os.Stderr, "Panic: %+v\n", rvr)
-				debug.PrintStack()
+				se := &HTTPError{
+					HTTPStatus: http.StatusInternalServerError,
+					Message:    http.StatusText(http.StatusInternalServerError),
+				}
+				HandleResponseError(se, w, r)
 			}
-
-			se := &HTTPError{
-				HTTPStatus: http.StatusInternalServerError,
-				Message:    http.StatusText(http.StatusInternalServerError),
-			}
-			HandleResponseError(se, w, r)
-		}
-	}()
-
-	return nil, nil
+		}()
+		next.ServeHTTP(w, r)
+	}
+	return http.HandlerFunc(fn)
 }
 
 // ErrorCause is an error interface that contains the method Cause() for returning root cause errors
@@ -182,8 +184,8 @@ type HTTPErrorResponse20240101 struct {
 }
 
 func HandleResponseError(err error, w http.ResponseWriter, r *http.Request) {
-	log := observability.GetLogEntry(r)
-	errorID := getRequestID(r.Context())
+	log := observability.GetLogEntry(r).Entry
+	errorID := utilities.GetRequestID(r.Context())
 
 	apiVersion, averr := DetermineClosestAPIVersion(r.Header.Get(APIVersionHeaderName))
 	if averr != nil {
@@ -207,8 +209,8 @@ func HandleResponseError(err error, w http.ResponseWriter, r *http.Request) {
 			output.Message = e.Message
 			output.Payload.Reasons = e.Reasons
 
-			if jsonErr := sendJSON(w, http.StatusUnprocessableEntity, output); jsonErr != nil {
-				HandleResponseError(jsonErr, w, r)
+			if jsonErr := sendJSON(w, http.StatusUnprocessableEntity, output); jsonErr != nil && jsonErr != context.DeadlineExceeded {
+				log.WithError(jsonErr).Warn("Failed to send JSON on ResponseWriter")
 			}
 
 		} else {
@@ -224,8 +226,8 @@ func HandleResponseError(err error, w http.ResponseWriter, r *http.Request) {
 			output.Message = e.Message
 			output.Payload.Reasons = e.Reasons
 
-			if jsonErr := sendJSON(w, output.HTTPStatus, output); jsonErr != nil {
-				HandleResponseError(jsonErr, w, r)
+			if jsonErr := sendJSON(w, output.HTTPStatus, output); jsonErr != nil && jsonErr != context.DeadlineExceeded {
+				log.WithError(jsonErr).Warn("Failed to send JSON on ResponseWriter")
 			}
 		}
 
@@ -252,8 +254,8 @@ func HandleResponseError(err error, w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			if jsonErr := sendJSON(w, e.HTTPStatus, resp); jsonErr != nil {
-				HandleResponseError(jsonErr, w, r)
+			if jsonErr := sendJSON(w, e.HTTPStatus, resp); jsonErr != nil && jsonErr != context.DeadlineExceeded {
+				log.WithError(jsonErr).Warn("Failed to send JSON on ResponseWriter")
 			}
 		} else {
 			if e.ErrorCode == "" {
@@ -266,21 +268,21 @@ func HandleResponseError(err error, w http.ResponseWriter, r *http.Request) {
 
 			// Provide better error messages for certain user-triggered Postgres errors.
 			if pgErr := utilities.NewPostgresError(e.InternalError); pgErr != nil {
-				if jsonErr := sendJSON(w, pgErr.HttpStatusCode, pgErr); jsonErr != nil {
-					HandleResponseError(jsonErr, w, r)
+				if jsonErr := sendJSON(w, pgErr.HttpStatusCode, pgErr); jsonErr != nil && jsonErr != context.DeadlineExceeded {
+					log.WithError(jsonErr).Warn("Failed to send JSON on ResponseWriter")
 				}
 				return
 			}
 
-			if jsonErr := sendJSON(w, e.HTTPStatus, e); jsonErr != nil {
-				HandleResponseError(jsonErr, w, r)
+			if jsonErr := sendJSON(w, e.HTTPStatus, e); jsonErr != nil && jsonErr != context.DeadlineExceeded {
+				log.WithError(jsonErr).Warn("Failed to send JSON on ResponseWriter")
 			}
 		}
 
 	case *OAuthError:
 		log.WithError(e.Cause()).Info(e.Error())
-		if jsonErr := sendJSON(w, http.StatusBadRequest, e); jsonErr != nil {
-			HandleResponseError(jsonErr, w, r)
+		if jsonErr := sendJSON(w, http.StatusBadRequest, e); jsonErr != nil && jsonErr != context.DeadlineExceeded {
+			log.WithError(jsonErr).Warn("Failed to send JSON on ResponseWriter")
 		}
 
 	case ErrorCause:
@@ -295,8 +297,8 @@ func HandleResponseError(err error, w http.ResponseWriter, r *http.Request) {
 				Message: "Unexpected failure, please check server logs for more information",
 			}
 
-			if jsonErr := sendJSON(w, http.StatusInternalServerError, resp); jsonErr != nil {
-				HandleResponseError(jsonErr, w, r)
+			if jsonErr := sendJSON(w, http.StatusInternalServerError, resp); jsonErr != nil && jsonErr != context.DeadlineExceeded {
+				log.WithError(jsonErr).Warn("Failed to send JSON on ResponseWriter")
 			}
 		} else {
 			httpError := HTTPError{
@@ -305,9 +307,15 @@ func HandleResponseError(err error, w http.ResponseWriter, r *http.Request) {
 				Message:    "Unexpected failure, please check server logs for more information",
 			}
 
-			if jsonErr := sendJSON(w, http.StatusInternalServerError, httpError); jsonErr != nil {
-				HandleResponseError(jsonErr, w, r)
+			if jsonErr := sendJSON(w, http.StatusInternalServerError, httpError); jsonErr != nil && jsonErr != context.DeadlineExceeded {
+				log.WithError(jsonErr).Warn("Failed to send JSON on ResponseWriter")
 			}
 		}
 	}
+}
+
+func generateFrequencyLimitErrorMessage(timeStamp *time.Time, maxFrequency time.Duration) string {
+	now := time.Now()
+	left := timeStamp.Add(maxFrequency).Sub(now) / time.Second
+	return fmt.Sprintf("For security purposes, you can only request this after %d seconds.", left)
 }

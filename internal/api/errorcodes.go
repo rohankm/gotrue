@@ -47,7 +47,6 @@ const (
 	ErrorCodeSMSSendFailed                     ErrorCode = "sms_send_failed"
 	ErrorCodeEmailNotConfirmed                 ErrorCode = "email_not_confirmed"
 	ErrorCodePhoneNotConfirmed                 ErrorCode = "phone_not_confirmed"
-	ErrorCodeReauthNonceMissing                ErrorCode = "reauth_nonce_missing"
 	ErrorCodeSAMLRelayStateNotFound            ErrorCode = "saml_relay_state_not_found"
 	ErrorCodeSAMLRelayStateExpired             ErrorCode = "saml_relay_state_expired"
 	ErrorCodeSAMLIdPNotFound                   ErrorCode = "saml_idp_not_found"
@@ -74,4 +73,9 @@ const (
 	ErrorCodeOverSMSSendRateLimit              ErrorCode = "over_sms_send_rate_limit"
 	ErrorBadCodeVerifier                       ErrorCode = "bad_code_verifier"
 	ErrorCodeAnonymousProviderDisabled         ErrorCode = "anonymous_provider_disabled"
+	ErrorCodeHookTimeout                       ErrorCode = "hook_timeout"
+	ErrorCodeHookTimeoutAfterRetry             ErrorCode = "hook_timeout_after_retry"
+	ErrorCodeHookPayloadOverSizeLimit          ErrorCode = "hook_payload_over_size_limit"
+	ErrorCodeHookPayloadUnknownSize            ErrorCode = "hook_payload_unknown_size"
+	ErrorCodeRequestTimeout                    ErrorCode = "request_timeout"
 )

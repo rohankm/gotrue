@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/fatih/structs"
-	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/v5"
 	"github.com/gofrs/uuid"
 	"github.com/sethvargo/go-password/password"
 	"github.com/supabase/auth/internal/api/provider"
@@ -134,6 +134,7 @@ func (a *API) adminUserGet(w http.ResponseWriter, r *http.Request) error {
 func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	db := a.db.WithContext(ctx)
+	config := a.config
 	user := getUser(ctx)
 	adminUser := getAdminUser(ctx)
 	params, err := a.getAdminParams(r)
@@ -175,7 +176,7 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 
-		if err := user.SetPassword(ctx, password); err != nil {
+		if err := user.SetPassword(ctx, password, config.Security.DBEncryption.Encrypt, config.Security.DBEncryption.EncryptionKeyID, config.Security.DBEncryption.EncryptionKey); err != nil {
 			return err
 		}
 	}
@@ -213,8 +214,9 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 				// if the user doesn't have an existing email
 				// then updating the user's email should create a new email identity
 				i, terr := a.createNewIdentity(tx, user, "email", structs.Map(provider.Claims{
-					Subject: user.ID.String(),
-					Email:   params.Email,
+					Subject:       user.ID.String(),
+					Email:         params.Email,
+					EmailVerified: params.EmailConfirm,
 				}))
 				if terr != nil {
 					return terr
@@ -223,11 +225,19 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 			} else {
 				// update the existing email identity
 				if terr := identity.UpdateIdentityData(tx, map[string]interface{}{
-					"email": params.Email,
+					"email":          params.Email,
+					"email_verified": params.EmailConfirm,
 				}); terr != nil {
 					return terr
 				}
 			}
+			if user.IsAnonymous && params.EmailConfirm {
+				user.IsAnonymous = false
+				if terr := tx.UpdateOnly(user, "is_anonymous"); terr != nil {
+					return terr
+				}
+			}
+
 			if terr := user.SetEmail(tx, params.Email); terr != nil {
 				return terr
 			}
@@ -240,8 +250,9 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 				// if the user doesn't have an existing phone
 				// then updating the user's phone should create a new phone identity
 				identity, terr := a.createNewIdentity(tx, user, "phone", structs.Map(provider.Claims{
-					Subject: user.ID.String(),
-					Phone:   params.Phone,
+					Subject:       user.ID.String(),
+					Phone:         params.Phone,
+					PhoneVerified: params.PhoneConfirm,
 				}))
 				if terr != nil {
 					return terr
@@ -250,8 +261,15 @@ func (a *API) adminUserUpdate(w http.ResponseWriter, r *http.Request) error {
 			} else {
 				// update the existing phone identity
 				if terr := identity.UpdateIdentityData(tx, map[string]interface{}{
-					"phone": params.Phone,
+					"phone":          params.Phone,
+					"phone_verified": params.PhoneConfirm,
 				}); terr != nil {
+					return terr
+				}
+			}
+			if user.IsAnonymous && params.PhoneConfirm {
+				user.IsAnonymous = false
+				if terr := tx.UpdateOnly(user, "is_anonymous"); terr != nil {
 					return terr
 				}
 			}
@@ -500,10 +518,6 @@ func (a *API) adminUserDelete(w http.ResponseWriter, r *http.Request) error {
 			if terr := models.Logout(tx, user.ID); terr != nil {
 				return internalServerError("Error deleting user's sessions").WithInternalError(terr)
 			}
-			// for backward compatibility: hard delete all associated refresh tokens
-			if terr := models.LogoutAllRefreshTokens(tx, user.ID); terr != nil {
-				return internalServerError("Error deleting user's refresh tokens").WithInternalError(terr)
-			}
 		} else {
 			if terr := tx.Destroy(user); terr != nil {
 				return internalServerError("Database error deleting user").WithInternalError(terr)
@@ -545,11 +559,7 @@ func (a *API) adminUserDeleteFactor(w http.ResponseWriter, r *http.Request) erro
 func (a *API) adminUserGetFactors(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	user := getUser(ctx)
-	factors, terr := models.FindFactorsByUser(a.db, user)
-	if terr != nil {
-		return terr
-	}
-	return sendJSON(w, http.StatusOK, factors)
+	return sendJSON(w, http.StatusOK, user.Factors)
 }
 
 // adminUserUpdate updates a single factor object

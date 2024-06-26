@@ -4,7 +4,7 @@ We would love to have contributions from each and every one of you in the commun
 
 ## Code Of Conduct
 
-Please help us keep all our projects open and inclusive. Kindly follow our [Code of Conduct](<(CODE_OF_CONDUCT.md)>) to keep the ecosystem healthy and friendly for all.
+Please help us keep all our projects open and inclusive. Kindly follow our [Code of Conduct](CODE_OF_CONDUCT.md) to keep the ecosystem healthy and friendly for all.
 
 ## Quick Start
 
@@ -59,11 +59,11 @@ Therefore, to contribute to Auth you will need to install these tools.
 
 ### Install Tools
 
-- Install [Go](https://go.dev) 1.21
+- Install [Go](https://go.dev) 1.22
 
 ```terminal
 # Via Homebrew on OSX
-brew install go@1.21
+brew install go@1.22
 
 # Set the GOPATH environment variable in the ~/.zshrc file
 export GOPATH="$HOME/go"
@@ -253,6 +253,7 @@ To see the current settings, make a request to `http://localhost:9999/settings` 
     "facebook": false,
     "spotify": false,
     "slack": false,
+    "slack_oidc": false,
     "twitch": true,
     "twitter": false,
     "email": true,
@@ -484,11 +485,16 @@ export GOTRUE_DB_DATABASE_URL="postgres://supabase_auth_admin:root@localhost:743
 ## Helpful Docker Commands
 
 ```
+// file: docker-compose-dev.yml
+container_name: auth_postgres
+```
+
+```
 # Command line into bash on the PostgreSQL container
-docker exec -it auth_postgresql bash
+docker exec -it auth_postgres bash
 
 # Removes Container
-docker container rm -f auth_postgresql
+docker container rm -f auth_postgres
 
 # Removes volume
 docker volume rm postgres_data

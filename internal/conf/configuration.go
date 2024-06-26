@@ -2,6 +2,7 @@ package conf
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/url"
@@ -112,11 +113,12 @@ type MFAConfiguration struct {
 }
 
 type APIConfiguration struct {
-	Host            string
-	Port            string `envconfig:"PORT" default:"8081"`
-	Endpoint        string
-	RequestIDHeader string `envconfig:"REQUEST_ID_HEADER"`
-	ExternalURL     string `json:"external_url" envconfig:"API_EXTERNAL_URL" required:"true"`
+	Host               string
+	Port               string `envconfig:"PORT" default:"8081"`
+	Endpoint           string
+	RequestIDHeader    string        `envconfig:"REQUEST_ID_HEADER"`
+	ExternalURL        string        `json:"external_url" envconfig:"API_EXTERNAL_URL" required:"true"`
+	MaxRequestDuration time.Duration `json:"max_request_duration" split_words:"true" default:"10s"`
 }
 
 func (a *APIConfiguration) Validate() error {
@@ -221,6 +223,7 @@ type GlobalConfiguration struct {
 	RateLimitTokenRefresh   float64 `split_words:"true" default:"150"`
 	RateLimitSso            float64 `split_words:"true" default:"30"`
 	RateLimitAnonymousUsers float64 `split_words:"true" default:"30"`
+	RateLimitOtp            float64 `split_words:"true" default:"30"`
 
 	SiteURL         string   `json:"site_url" split_words:"true" required:"true"`
 	URIAllowList    []string `json:"uri_allow_list" split_words:"true"`
@@ -296,6 +299,7 @@ type ProviderConfiguration struct {
 	LinkedinOIDC            OAuthProviderConfiguration     `json:"linkedin_oidc" envconfig:"LINKEDIN_OIDC"`
 	Spotify                 OAuthProviderConfiguration     `json:"spotify"`
 	Slack                   OAuthProviderConfiguration     `json:"slack"`
+	SlackOIDC               OAuthProviderConfiguration     `json:"slack_oidc" envconfig:"SLACK_OIDC"`
 	Twitter                 OAuthProviderConfiguration     `json:"twitter"`
 	Twitch                  OAuthProviderConfiguration     `json:"twitch"`
 	WorkOS                  OAuthProviderConfiguration     `json:"workos"`
@@ -426,16 +430,74 @@ func (c *CaptchaConfiguration) Validate() error {
 	return nil
 }
 
+// DatabaseEncryptionConfiguration configures Auth to encrypt certain columns.
+// Once Encrypt is set to true, data will start getting encrypted with the
+// provided encryption key. Setting it to false just stops encryption from
+// going on further, but DecryptionKeys would have to contain the same key so
+// the encrypted data remains accessible.
+type DatabaseEncryptionConfiguration struct {
+	Encrypt bool `json:"encrypt"`
+
+	EncryptionKeyID string `json:"encryption_key_id" split_words:"true"`
+	EncryptionKey   string `json:"-" split_words:"true"`
+
+	DecryptionKeys map[string]string `json:"-" split_words:"true"`
+}
+
+func (c *DatabaseEncryptionConfiguration) Validate() error {
+	if c.Encrypt {
+		if c.EncryptionKeyID == "" {
+			return errors.New("conf: encryption key ID must be specified")
+		}
+
+		decodedKey, err := base64.RawURLEncoding.DecodeString(c.EncryptionKey)
+		if err != nil {
+			return err
+		}
+
+		if len(decodedKey) != 256/8 {
+			return errors.New("conf: encryption key is not 256 bits")
+		}
+
+		if c.DecryptionKeys == nil || c.DecryptionKeys[c.EncryptionKeyID] == "" {
+			return errors.New("conf: encryption key must also be present in decryption keys")
+		}
+	}
+
+	for id, key := range c.DecryptionKeys {
+		decodedKey, err := base64.RawURLEncoding.DecodeString(key)
+		if err != nil {
+			return err
+		}
+
+		if len(decodedKey) != 256/8 {
+			return fmt.Errorf("conf: decryption key with ID %q must be 256 bits", id)
+		}
+	}
+
+	return nil
+}
+
 type SecurityConfiguration struct {
 	Captcha                               CaptchaConfiguration `json:"captcha"`
 	RefreshTokenRotationEnabled           bool                 `json:"refresh_token_rotation_enabled" split_words:"true" default:"true"`
 	RefreshTokenReuseInterval             int                  `json:"refresh_token_reuse_interval" split_words:"true"`
 	UpdatePasswordRequireReauthentication bool                 `json:"update_password_require_reauthentication" split_words:"true"`
 	ManualLinkingEnabled                  bool                 `json:"manual_linking_enabled" split_words:"true" default:"false"`
+
+	DBEncryption DatabaseEncryptionConfiguration `json:"database_encryption" split_words:"true"`
 }
 
 func (c *SecurityConfiguration) Validate() error {
-	return c.Captcha.Validate()
+	if err := c.Captcha.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.DBEncryption.Validate(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func loadEnvironment(filename string) error {
@@ -457,7 +519,8 @@ type HookConfiguration struct {
 	MFAVerificationAttempt      ExtensibilityPointConfiguration `json:"mfa_verification_attempt" split_words:"true"`
 	PasswordVerificationAttempt ExtensibilityPointConfiguration `json:"password_verification_attempt" split_words:"true"`
 	CustomAccessToken           ExtensibilityPointConfiguration `json:"custom_access_token" split_words:"true"`
-	CustomSMSProvider           ExtensibilityPointConfiguration `json:"custom_sms_provider" split_words:"true"`
+	SendEmail                   ExtensibilityPointConfiguration `json:"send_email" split_words:"true"`
+	SendSMS                     ExtensibilityPointConfiguration `json:"send_sms" split_words:"true"`
 }
 
 type HTTPHookSecrets []string
@@ -478,7 +541,7 @@ type ExtensibilityPointConfiguration struct {
 	Enabled  bool   `json:"enabled"`
 	HookName string `json:"hook_name"`
 	// We use | as a separator for keys and : as a separator for keys within a keypair. For instance: v1,whsec_test|v1a,whpk_myother:v1a,whsk_testkey|v1,whsec_secret3
-	HTTPHookSecrets []string `json:"secrets" envconfig:"secrets"`
+	HTTPHookSecrets HTTPHookSecrets `json:"secrets" envconfig:"secrets"`
 }
 
 func (h *HookConfiguration) Validate() error {
@@ -486,7 +549,8 @@ func (h *HookConfiguration) Validate() error {
 		h.MFAVerificationAttempt,
 		h.PasswordVerificationAttempt,
 		h.CustomAccessToken,
-		h.CustomSMSProvider,
+		h.SendSMS,
+		h.SendEmail,
 	}
 	for _, point := range points {
 		if err := point.ValidateExtensibilityPoint(); err != nil {
@@ -509,12 +573,12 @@ func (e *ExtensibilityPointConfiguration) ValidateExtensibilityPoint() error {
 		return validatePostgresPath(u)
 	case "http":
 		hostname := u.Hostname()
-		if hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" {
-			return validateHTTPSHookSecrets(e.HTTPHookSecrets)
+		if hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" || hostname == "host.docker.internal" {
+			return validateHTTPHookSecrets(e.HTTPHookSecrets)
 		}
 		return fmt.Errorf("only localhost, 127.0.0.1, and ::1 are supported with http")
 	case "https":
-		return validateHTTPSHookSecrets(e.HTTPHookSecrets)
+		return validateHTTPHookSecrets(e.HTTPHookSecrets)
 	default:
 		return fmt.Errorf("only postgres hooks and HTTPS functions are supported at the moment")
 	}
@@ -542,7 +606,7 @@ func isValidSecretFormat(secret string) bool {
 	return symmetricSecretFormat.MatchString(secret) || asymmetricSecretFormat.MatchString(secret)
 }
 
-func validateHTTPSHookSecrets(secrets []string) error {
+func validateHTTPHookSecrets(secrets []string) error {
 	for _, secret := range secrets {
 		if !isValidSecretFormat(secret) {
 			return fmt.Errorf("invalid secret format")
@@ -552,15 +616,14 @@ func validateHTTPSHookSecrets(secrets []string) error {
 }
 
 func (e *ExtensibilityPointConfiguration) PopulateExtensibilityPoint() error {
-	if err := e.ValidateExtensibilityPoint(); err != nil {
-		return err
-	}
 	u, err := url.Parse(e.URI)
 	if err != nil {
 		return err
 	}
-	pathParts := strings.Split(u.Path, "/")
-	e.HookName = fmt.Sprintf("%q.%q", pathParts[1], pathParts[2])
+	if u.Scheme == "pg-functions" {
+		pathParts := strings.Split(u.Path, "/")
+		e.HookName = fmt.Sprintf("%q.%q", pathParts[1], pathParts[2])
+	}
 	return nil
 }
 
@@ -591,8 +654,13 @@ func LoadGlobal(filename string) (*GlobalConfiguration, error) {
 		}
 	}
 
-	if config.Hook.CustomSMSProvider.Enabled {
-		if err := config.Hook.CustomSMSProvider.PopulateExtensibilityPoint(); err != nil {
+	if config.Hook.SendSMS.Enabled {
+		if err := config.Hook.SendSMS.PopulateExtensibilityPoint(); err != nil {
+			return nil, err
+		}
+	}
+	if config.Hook.SendEmail.Enabled {
+		if err := config.Hook.SendEmail.PopulateExtensibilityPoint(); err != nil {
 			return nil, err
 		}
 	}
@@ -689,6 +757,15 @@ func (config *GlobalConfiguration) ApplyDefaults() error {
 	if config.Sms.OtpLength == 0 || config.Sms.OtpLength < 6 || config.Sms.OtpLength > 10 {
 		// 6-digit otp by default
 		config.Sms.OtpLength = 6
+	}
+
+	if config.Sms.TestOTP != nil {
+		formatTestOtps := make(map[string]string)
+		for phone, otp := range config.Sms.TestOTP {
+			phone = strings.ReplaceAll(strings.TrimPrefix(phone, "+"), " ", "")
+			formatTestOtps[phone] = otp
+		}
+		config.Sms.TestOTP = formatTestOtps
 	}
 
 	if len(config.Sms.Template) == 0 {

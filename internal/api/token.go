@@ -145,7 +145,10 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 		return oauthError("invalid_grant", InvalidLoginMessage)
 	}
 
-	isValidPassword := user.Authenticate(ctx, params.Password)
+	isValidPassword, shouldReEncrypt, err := user.Authenticate(ctx, params.Password, config.Security.DBEncryption.DecryptionKeys, config.Security.DBEncryption.Encrypt, config.Security.DBEncryption.EncryptionKeyID)
+	if err != nil {
+		return err
+	}
 
 	var weakPasswordError *WeakPasswordError
 	if isValidPassword {
@@ -153,7 +156,21 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 			if wpe, ok := err.(*WeakPasswordError); ok {
 				weakPasswordError = wpe
 			} else {
-				observability.GetLogEntry(r).WithError(err).Warn("Password strength check on sign-in failed")
+				observability.GetLogEntry(r).Entry.WithError(err).Warn("Password strength check on sign-in failed")
+			}
+		}
+
+		if shouldReEncrypt {
+			if err := user.SetPassword(ctx, params.Password, true, config.Security.DBEncryption.EncryptionKeyID, config.Security.DBEncryption.EncryptionKey); err != nil {
+				return err
+			}
+
+			// directly change this in the database without
+			// calling user.UpdatePassword() because this
+			// is not a password change, just encryption
+			// change in the database
+			if err := db.UpdateOnly(user, "encrypted_password"); err != nil {
+				return err
 			}
 		}
 	}
@@ -164,7 +181,7 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 			Valid:  isValidPassword,
 		}
 		output := hooks.PasswordVerificationAttemptOutput{}
-		err := a.invokeHook(ctx, nil, &input, &output)
+		err := a.invokeHook(nil, r, &input, &output, a.config.Hook.PasswordVerificationAttempt.URI)
 		if err != nil {
 			return err
 		}
@@ -199,7 +216,7 @@ func (a *API) ResourceOwnerPasswordGrant(ctx context.Context, w http.ResponseWri
 		}); terr != nil {
 			return terr
 		}
-		token, terr = a.issueRefreshToken(ctx, tx, user, models.PasswordGrant, grantParams)
+		token, terr = a.issueRefreshToken(r, tx, user, models.PasswordGrant, grantParams)
 		if terr != nil {
 			return terr
 		}
@@ -269,7 +286,7 @@ func (a *API) PKCE(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 		}); terr != nil {
 			return terr
 		}
-		token, terr = a.issueRefreshToken(ctx, tx, user, authMethod, grantParams)
+		token, terr = a.issueRefreshToken(r, tx, user, authMethod, grantParams)
 		if terr != nil {
 			return oauthError("server_error", terr.Error())
 		}
@@ -291,20 +308,19 @@ func (a *API) PKCE(ctx context.Context, w http.ResponseWriter, r *http.Request) 
 	return sendJSON(w, http.StatusOK, token)
 }
 
-func (a *API) generateAccessToken(ctx context.Context, tx *storage.Connection, user *models.User, sessionId *uuid.UUID, authenticationMethod models.AuthenticationMethod) (string, int64, error) {
+func (a *API) generateAccessToken(r *http.Request, tx *storage.Connection, user *models.User, sessionId *uuid.UUID, authenticationMethod models.AuthenticationMethod) (string, int64, error) {
 	config := a.config
-	aal, amr := models.AAL1.String(), []models.AMREntry{}
-	sid := ""
-	if sessionId != nil {
-		sid = sessionId.String()
-		session, terr := models.FindSessionByID(tx, *sessionId, false)
-		if terr != nil {
-			return "", 0, terr
-		}
-		aal, amr, terr = session.CalculateAALAndAMR(user)
-		if terr != nil {
-			return "", 0, terr
-		}
+	if sessionId == nil {
+		return "", 0, internalServerError("Session is required to issue access token")
+	}
+	sid := sessionId.String()
+	session, terr := models.FindSessionByID(tx, *sessionId, false)
+	if terr != nil {
+		return "", 0, terr
+	}
+	aal, amr, terr := session.CalculateAALAndAMR(user)
+	if terr != nil {
+		return "", 0, terr
 	}
 
 	issuedAt := time.Now().UTC()
@@ -324,7 +340,7 @@ func (a *API) generateAccessToken(ctx context.Context, tx *storage.Connection, u
 		UserMetaData:                  user.UserMetaData,
 		Role:                          user.Role,
 		SessionId:                     sid,
-		AuthenticatorAssuranceLevel:   aal,
+		AuthenticatorAssuranceLevel:   aal.String(),
 		AuthenticationMethodReference: amr,
 		IsAnonymous:                   user.IsAnonymous,
 	}
@@ -339,7 +355,7 @@ func (a *API) generateAccessToken(ctx context.Context, tx *storage.Connection, u
 
 		output := hooks.CustomAccessTokenOutput{}
 
-		err := a.invokeHook(ctx, tx, &input, &output)
+		err := a.invokeHook(tx, r, &input, &output, a.config.Hook.CustomAccessToken.URI)
 		if err != nil {
 			return "", 0, err
 		}
@@ -367,7 +383,7 @@ func (a *API) generateAccessToken(ctx context.Context, tx *storage.Connection, u
 	return signed, expiresAt, nil
 }
 
-func (a *API) issueRefreshToken(ctx context.Context, conn *storage.Connection, user *models.User, authenticationMethod models.AuthenticationMethod, grantParams models.GrantParams) (*AccessTokenResponse, error) {
+func (a *API) issueRefreshToken(r *http.Request, conn *storage.Connection, user *models.User, authenticationMethod models.AuthenticationMethod, grantParams models.GrantParams) (*AccessTokenResponse, error) {
 	config := a.config
 
 	now := time.Now()
@@ -390,7 +406,7 @@ func (a *API) issueRefreshToken(ctx context.Context, conn *storage.Connection, u
 			return terr
 		}
 
-		tokenString, expiresAt, terr = a.generateAccessToken(ctx, tx, user, refreshToken.SessionId, authenticationMethod)
+		tokenString, expiresAt, terr = a.generateAccessToken(r, tx, user, refreshToken.SessionId, authenticationMethod)
 		if terr != nil {
 			// Account for Hook Error
 			httpErr, ok := terr.(*HTTPError)
@@ -452,14 +468,11 @@ func (a *API) updateMFASessionAndClaims(r *http.Request, tx *storage.Connection,
 			return terr
 		}
 
-		if err := session.UpdateAssociatedFactor(tx, grantParams.FactorID); err != nil {
-			return err
-		}
-		if err := session.UpdateAssociatedAAL(tx, aal); err != nil {
+		if err := session.UpdateAALAndAssociatedFactor(tx, aal, grantParams.FactorID); err != nil {
 			return err
 		}
 
-		tokenString, expiresAt, terr = a.generateAccessToken(ctx, tx, user, &session.ID, models.TOTPSignIn)
+		tokenString, expiresAt, terr = a.generateAccessToken(r, tx, user, &session.ID, models.TOTPSignIn)
 		if terr != nil {
 			httpErr, ok := terr.(*HTTPError)
 			if ok {

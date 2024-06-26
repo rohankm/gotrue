@@ -83,8 +83,10 @@ func (ts *UserTestSuite) TestUpdateUserMetadata() {
 
 func (ts *UserTestSuite) TestFindUserByConfirmationToken() {
 	u := ts.createUser()
+	tokenHash := "test_confirmation_token"
+	require.NoError(ts.T(), CreateOneTimeToken(ts.db, u.ID, "relates_to not used", tokenHash, ConfirmationToken))
 
-	n, err := FindUserByConfirmationToken(ts.db, u.ConfirmationToken)
+	n, err := FindUserByConfirmationToken(ts.db, tokenHash)
 	require.NoError(ts.T(), err)
 	require.Equal(ts.T(), u.ID, n.ID)
 }
@@ -136,14 +138,11 @@ func (ts *UserTestSuite) TestFindUserByID() {
 
 func (ts *UserTestSuite) TestFindUserByRecoveryToken() {
 	u := ts.createUser()
-	u.RecoveryToken = "asdf"
+	tokenHash := "test_recovery_token"
+	require.NoError(ts.T(), CreateOneTimeToken(ts.db, u.ID, "relates_to not used", tokenHash, RecoveryToken))
 
-	err := ts.db.Update(u)
+	n, err := FindUserByRecoveryToken(ts.db, tokenHash)
 	require.NoError(ts.T(), err)
-
-	n, err := FindUserByRecoveryToken(ts.db, u.RecoveryToken)
-	require.NoError(ts.T(), err)
-
 	require.Equal(ts.T(), u.ID, n.ID)
 }
 
@@ -373,9 +372,9 @@ func (ts *UserTestSuite) TestSetPasswordTooLong() {
 	require.NoError(ts.T(), err)
 	require.NoError(ts.T(), ts.db.Create(user))
 
-	err = user.SetPassword(ts.db.Context(), strings.Repeat("a", crypto.MaxPasswordLength+1))
+	err = user.SetPassword(ts.db.Context(), strings.Repeat("a", crypto.MaxPasswordLength+1), false, "", "")
 	require.Error(ts.T(), err)
 
-	err = user.SetPassword(ts.db.Context(), strings.Repeat("a", crypto.MaxPasswordLength))
+	err = user.SetPassword(ts.db.Context(), strings.Repeat("a", crypto.MaxPasswordLength), false, "", "")
 	require.NoError(ts.T(), err)
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/gobuffalo/pop/v6"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
+	"github.com/supabase/auth/internal/crypto"
 	"github.com/supabase/auth/internal/storage"
 )
 
@@ -127,30 +128,44 @@ func (Factor) TableName() string {
 	return tableName
 }
 
-func NewFactor(user *User, friendlyName string, factorType string, state FactorState, secret string) *Factor {
+func NewFactor(user *User, friendlyName string, factorType string, state FactorState) *Factor {
 	id := uuid.Must(uuid.NewV4())
 
 	factor := &Factor{
-		UserID:       user.ID,
 		ID:           id,
+		UserID:       user.ID,
 		Status:       state.String(),
 		FriendlyName: friendlyName,
-		Secret:       secret,
 		FactorType:   factorType,
 	}
 	return factor
 }
 
-// FindFactorsByUser returns all factors belonging to a user ordered by timestamp
-func FindFactorsByUser(tx *storage.Connection, user *User) ([]*Factor, error) {
-	factors := []*Factor{}
-	if err := tx.Q().Where("user_id = ?", user.ID).Order("created_at asc").All(&factors); err != nil {
-		if errors.Cause(err) == sql.ErrNoRows {
-			return factors, nil
+func (f *Factor) SetSecret(secret string, encrypt bool, encryptionKeyID, encryptionKey string) error {
+	f.Secret = secret
+	if encrypt {
+		es, err := crypto.NewEncryptedString(f.ID.String(), []byte(secret), encryptionKeyID, encryptionKey)
+		if err != nil {
+			return err
 		}
-		return nil, errors.Wrap(err, "Database error when finding MFA factors associated to user")
+
+		f.Secret = es.String()
 	}
-	return factors, nil
+
+	return nil
+}
+
+func (f *Factor) GetSecret(decryptionKeys map[string]string, encrypt bool, encryptionKeyID string) (string, bool, error) {
+	if es := crypto.ParseEncryptedString(f.Secret); es != nil {
+		bytes, err := es.Decrypt(f.ID.String(), decryptionKeys)
+		if err != nil {
+			return "", false, err
+		}
+
+		return string(bytes), encrypt && es.ShouldReEncrypt(encryptionKeyID), nil
+	}
+
+	return f.Secret, encrypt, nil
 }
 
 func FindFactorByFactorID(conn *storage.Connection, factorID uuid.UUID) (*Factor, error) {

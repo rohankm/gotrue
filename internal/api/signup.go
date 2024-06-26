@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"time"
 
@@ -14,7 +13,6 @@ import (
 	"github.com/supabase/auth/internal/metering"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/storage"
-	"github.com/supabase/auth/internal/utilities"
 )
 
 // SignupParams are the parameters the Signup endpoint accepts
@@ -199,7 +197,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 				return terr
 			}
 		}
-		identity, terr := models.FindIdentityByIdAndProvider(tx, user.ID.String(), "email")
+		identity, terr := models.FindIdentityByIdAndProvider(tx, user.ID.String(), params.Provider)
 		if terr != nil {
 			if !models.IsNotFoundError(terr) {
 				return terr
@@ -234,8 +232,6 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 					return internalServerError("Database error updating user").WithInternalError(terr)
 				}
 			} else {
-				mailer := a.Mailer(ctx)
-				referrer := utilities.GetReferrer(r, config)
 				if terr = models.NewAuditLogEntry(r, tx, user, models.UserConfirmationRequestedAction, "", map[string]interface{}{
 					"provider": params.Provider,
 				}); terr != nil {
@@ -247,12 +243,9 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 						return terr
 					}
 				}
-				externalURL := getExternalHost(ctx)
-				if terr = sendConfirmation(tx, user, mailer, config.SMTP.MaxFrequency, referrer, externalURL, config.Mailer.OtpLength, flowType); terr != nil {
+				if terr = a.sendConfirmation(r, tx, user, flowType); terr != nil {
 					if errors.Is(terr, MaxFrequencyLimitError) {
-						now := time.Now()
-						left := user.ConfirmationSentAt.Add(config.SMTP.MaxFrequency).Sub(now) / time.Second
-						return tooManyRequestsError(ErrorCodeOverEmailSendRateLimit, fmt.Sprintf("For security purposes, you can only request this after %d seconds.", left))
+						return tooManyRequestsError(ErrorCodeOverEmailSendRateLimit, generateFrequencyLimitErrorMessage(user.ConfirmationSentAt, config.SMTP.MaxFrequency))
 					}
 					return internalServerError("Error sending confirmation mail").WithInternalError(terr)
 				}
@@ -278,7 +271,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 				if terr != nil {
 					return internalServerError("Unable to get SMS provider").WithInternalError(terr)
 				}
-				if _, terr := a.sendPhoneConfirmation(tx, user, params.Phone, phoneConfirmationOtp, smsProvider, params.Channel); terr != nil {
+				if _, terr := a.sendPhoneConfirmation(r, tx, user, params.Phone, phoneConfirmationOtp, smsProvider, params.Channel); terr != nil {
 					return unprocessableEntityError(ErrorCodeSMSSendFailed, "Error sending confirmation sms: %v", terr).WithInternalError(terr)
 				}
 			}
@@ -329,7 +322,7 @@ func (a *API) Signup(w http.ResponseWriter, r *http.Request) error {
 			}); terr != nil {
 				return terr
 			}
-			token, terr = a.issueRefreshToken(ctx, tx, user, models.PasswordGrant, grantParams)
+			token, terr = a.issueRefreshToken(r, tx, user, models.PasswordGrant, grantParams)
 
 			if terr != nil {
 				return terr

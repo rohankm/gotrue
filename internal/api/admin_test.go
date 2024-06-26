@@ -350,7 +350,10 @@ func (ts *AdminTestSuite) TestAdminUserCreate() {
 				expectedPassword = fmt.Sprintf("%v", c.params["password"])
 			}
 
-			assert.Equal(ts.T(), c.expected["isAuthenticated"], u.Authenticate(context.Background(), expectedPassword))
+			isAuthenticated, _, err := u.Authenticate(context.Background(), expectedPassword, ts.API.config.Security.DBEncryption.DecryptionKeys, ts.API.config.Security.DBEncryption.Encrypt, ts.API.config.Security.DBEncryption.EncryptionKeyID)
+			require.NoError(ts.T(), err)
+
+			assert.Equal(ts.T(), c.expected["isAuthenticated"], isAuthenticated)
 
 			// remove created user after each case
 			require.NoError(ts.T(), ts.API.db.Destroy(u))
@@ -594,6 +597,11 @@ func (ts *AdminTestSuite) TestAdminUserSoftDeletion() {
 		"provider": "email",
 	}
 	require.NoError(ts.T(), ts.API.db.Create(u))
+	require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, u.ID, u.GetEmail(), u.ConfirmationToken, models.ConfirmationToken))
+	require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, u.ID, u.GetEmail(), u.RecoveryToken, models.RecoveryToken))
+	require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, u.ID, u.GetEmail(), u.EmailChangeTokenCurrent, models.EmailChangeTokenCurrent))
+	require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, u.ID, u.GetEmail(), u.EmailChangeTokenNew, models.EmailChangeTokenNew))
+	require.NoError(ts.T(), models.CreateOneTimeToken(ts.API.db, u.ID, u.GetPhone(), u.PhoneChangeToken, models.PhoneChangeToken))
 
 	// create user identities
 	_, err = ts.API.createNewIdentity(ts.API.db, u, "email", map[string]interface{}{
@@ -721,7 +729,8 @@ func (ts *AdminTestSuite) TestAdminUserDeleteFactor() {
 	require.NoError(ts.T(), err, "Error making new user")
 	require.NoError(ts.T(), ts.API.db.Create(u), "Error creating user")
 
-	f := models.NewFactor(u, "testSimpleName", models.TOTP, models.FactorStateVerified, "secretkey")
+	f := models.NewFactor(u, "testSimpleName", models.TOTP, models.FactorStateVerified)
+	require.NoError(ts.T(), f.SetSecret("secretkey", ts.Config.Security.DBEncryption.Encrypt, ts.Config.Security.DBEncryption.EncryptionKeyID, ts.Config.Security.DBEncryption.EncryptionKey))
 	require.NoError(ts.T(), ts.API.db.Create(f), "Error saving new test factor")
 
 	// Setup request
@@ -744,7 +753,8 @@ func (ts *AdminTestSuite) TestAdminUserGetFactors() {
 	require.NoError(ts.T(), err, "Error making new user")
 	require.NoError(ts.T(), ts.API.db.Create(u), "Error creating user")
 
-	f := models.NewFactor(u, "testSimpleName", models.TOTP, models.FactorStateUnverified, "secretkey")
+	f := models.NewFactor(u, "testSimpleName", models.TOTP, models.FactorStateUnverified)
+	require.NoError(ts.T(), f.SetSecret("secretkey", ts.Config.Security.DBEncryption.Encrypt, ts.Config.Security.DBEncryption.EncryptionKeyID, ts.Config.Security.DBEncryption.EncryptionKey))
 	require.NoError(ts.T(), ts.API.db.Create(f), "Error saving new test factor")
 
 	// Setup request
@@ -765,7 +775,8 @@ func (ts *AdminTestSuite) TestAdminUserUpdateFactor() {
 	require.NoError(ts.T(), err, "Error making new user")
 	require.NoError(ts.T(), ts.API.db.Create(u), "Error creating user")
 
-	f := models.NewFactor(u, "testSimpleName", models.TOTP, models.FactorStateUnverified, "secretkey")
+	f := models.NewFactor(u, "testSimpleName", models.TOTP, models.FactorStateUnverified)
+	require.NoError(ts.T(), f.SetSecret("secretkey", ts.Config.Security.DBEncryption.Encrypt, ts.Config.Security.DBEncryption.EncryptionKeyID, ts.Config.Security.DBEncryption.EncryptionKey))
 	require.NoError(ts.T(), ts.API.db.Create(f), "Error saving new test factor")
 
 	var cases = []struct {

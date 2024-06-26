@@ -1,18 +1,22 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/observability"
 	"github.com/supabase/auth/internal/security"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/didip/tollbooth/v5"
 	"github.com/didip/tollbooth/v5/limiter"
@@ -60,7 +64,7 @@ func (a *API) limitHandler(lmt *limiter.Limiter) middlewareHandler {
 			key := req.Header.Get(limitHeader)
 
 			if key == "" {
-				log := observability.GetLogEntry(req)
+				log := observability.GetLogEntry(req).Entry
 				log.WithField("header", limitHeader).Warn("request does not have a value for the rate limiting header, rate limiting is not applied")
 				return c, nil
 			} else {
@@ -110,7 +114,7 @@ func (a *API) limitEmailOrPhoneSentHandler() middlewareHandler {
 							emailRateLimitCounter.Add(
 								req.Context(),
 								1,
-								attribute.String("path", req.URL.Path),
+								metric.WithAttributeSet(attribute.NewSet(attribute.String("path", req.URL.Path))),
 							)
 							return c, tooManyRequestsError(ErrorCodeOverEmailSendRateLimit, "Email rate limit exceeded")
 						}
@@ -143,7 +147,7 @@ func (a *API) requireAdminCredentials(w http.ResponseWriter, req *http.Request) 
 		return nil, err
 	}
 
-	return a.requireAdmin(ctx, req)
+	return a.requireAdmin(ctx)
 }
 
 func (a *API) requireEmailProvider(w http.ResponseWriter, req *http.Request) (context.Context, error) {
@@ -210,7 +214,7 @@ func (a *API) isValidExternalHost(w http.ResponseWriter, req *http.Request) (con
 	}
 	if u, err = url.ParseRequestURI(baseUrl); err != nil {
 		// fallback to the default hostname
-		log := observability.GetLogEntry(req)
+		log := observability.GetLogEntry(req).Entry
 		log.WithField("request_url", baseUrl).Warn(err)
 		if u, err = url.ParseRequestURI(config.API.ExternalURL); err != nil {
 			return ctx, err
@@ -249,13 +253,138 @@ func (a *API) databaseCleanup(cleanup *models.Cleanup) func(http.Handler) http.H
 			}
 
 			db := a.db.WithContext(r.Context())
-			log := observability.GetLogEntry(r)
+			log := observability.GetLogEntry(r).Entry
 
 			affectedRows, err := cleanup.Clean(db)
 			if err != nil {
 				log.WithError(err).WithField("affected_rows", affectedRows).Warn("database cleanup failed")
 			} else if affectedRows > 0 {
 				log.WithField("affected_rows", affectedRows).Debug("cleaned up expired or stale rows")
+			}
+		})
+	}
+}
+
+// timeoutResponseWriter is a http.ResponseWriter that queues up a response
+// body to be sent if the serving completes before the context has exceeded its
+// deadline.
+type timeoutResponseWriter struct {
+	sync.Mutex
+
+	header      http.Header
+	wroteHeader bool
+	snapHeader  http.Header // snapshot of the header at the time WriteHeader was called
+	statusCode  int
+	buf         bytes.Buffer
+}
+
+func (t *timeoutResponseWriter) Header() http.Header {
+	t.Lock()
+	defer t.Unlock()
+
+	return t.header
+}
+
+func (t *timeoutResponseWriter) Write(bytes []byte) (int, error) {
+	t.Lock()
+	defer t.Unlock()
+
+	if !t.wroteHeader {
+		t.writeHeaderLocked(http.StatusOK)
+	}
+
+	return t.buf.Write(bytes)
+}
+
+func (t *timeoutResponseWriter) WriteHeader(statusCode int) {
+	t.Lock()
+	defer t.Unlock()
+
+	t.writeHeaderLocked(statusCode)
+}
+
+func (t *timeoutResponseWriter) writeHeaderLocked(statusCode int) {
+	if t.wroteHeader {
+		// ignore multiple calls to WriteHeader
+		// once WriteHeader has been called once, a snapshot of the header map is taken
+		// and saved in snapHeader to be used in finallyWrite
+		return
+	}
+
+	t.statusCode = statusCode
+	t.wroteHeader = true
+	t.snapHeader = t.header.Clone()
+}
+
+func (t *timeoutResponseWriter) finallyWrite(w http.ResponseWriter) {
+	t.Lock()
+	defer t.Unlock()
+
+	dst := w.Header()
+	for k, vv := range t.snapHeader {
+		dst[k] = vv
+	}
+
+	if !t.wroteHeader {
+		t.statusCode = http.StatusOK
+	}
+
+	w.WriteHeader(t.statusCode)
+	if _, err := w.Write(t.buf.Bytes()); err != nil {
+		logrus.WithError(err).Warn("Write failed")
+	}
+}
+
+func timeoutMiddleware(timeout time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), timeout)
+			defer cancel()
+
+			timeoutWriter := &timeoutResponseWriter{
+				header: make(http.Header),
+			}
+
+			panicChan := make(chan any, 1)
+			serverDone := make(chan struct{})
+			go func() {
+				defer func() {
+					if p := recover(); p != nil {
+						panicChan <- p
+					}
+				}()
+
+				next.ServeHTTP(timeoutWriter, r.WithContext(ctx))
+				close(serverDone)
+			}()
+
+			select {
+			case p := <-panicChan:
+				panic(p)
+
+			case <-serverDone:
+				timeoutWriter.finallyWrite(w)
+
+			case <-ctx.Done():
+				err := ctx.Err()
+
+				if err == context.DeadlineExceeded {
+					httpError := &HTTPError{
+						HTTPStatus: http.StatusGatewayTimeout,
+						ErrorCode:  ErrorCodeRequestTimeout,
+						Message:    "Processing this request timed out, please retry after a moment.",
+					}
+
+					httpError = httpError.WithInternalError(err)
+
+					HandleResponseError(httpError, w, r)
+				} else {
+					// unrecognized context error, so we should wait for the server to finish
+					// and write out the response
+					<-serverDone
+
+					timeoutWriter.finallyWrite(w)
+				}
 			}
 		})
 	}

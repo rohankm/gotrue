@@ -3,6 +3,7 @@ package hooks
 import (
 	"github.com/gofrs/uuid"
 	"github.com/golang-jwt/jwt"
+	"github.com/supabase/auth/internal/mailer"
 	"github.com/supabase/auth/internal/models"
 )
 
@@ -22,9 +23,18 @@ const (
 	HookRejection = "reject"
 )
 
+type HTTPHookInput interface {
+	IsHTTPHook()
+}
+
 type HookOutput interface {
 	IsError() bool
 	Error() string
+}
+
+// TODO(joel): Move this to phone package
+type SMS struct {
+	OTP string `json:"otp,omitempty"`
 }
 
 // #nosec
@@ -135,6 +145,26 @@ type CustomAccessTokenOutput struct {
 	HookError AuthHookError          `json:"error,omitempty"`
 }
 
+type SendSMSInput struct {
+	User *models.User `json:"user,omitempty"`
+	SMS  SMS          `json:"sms,omitempty"`
+}
+
+type SendSMSOutput struct {
+	Success   bool          `json:"success"`
+	HookError AuthHookError `json:"error,omitempty"`
+}
+
+type SendEmailInput struct {
+	User      *models.User     `json:"user"`
+	EmailData mailer.EmailData `json:"email_data"`
+}
+
+type SendEmailOutput struct {
+	Success   bool          `json:"success"`
+	HookError AuthHookError `json:"error,omitempty"`
+}
+
 func (mf *MFAVerificationAttemptOutput) IsError() bool {
 	return mf.HookError.Message != ""
 }
@@ -157,6 +187,22 @@ func (ca *CustomAccessTokenOutput) IsError() bool {
 
 func (ca *CustomAccessTokenOutput) Error() string {
 	return ca.HookError.Message
+}
+
+func (cs *SendSMSOutput) IsError() bool {
+	return cs.HookError.Message != ""
+}
+
+func (cs *SendSMSOutput) Error() string {
+	return cs.HookError.Message
+}
+
+func (cs *SendEmailOutput) IsError() bool {
+	return cs.HookError.Message != ""
+}
+
+func (cs *SendEmailOutput) Error() string {
+	return cs.HookError.Message
 }
 
 type AuthHookError struct {

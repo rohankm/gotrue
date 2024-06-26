@@ -2,7 +2,6 @@ package api
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,12 +12,15 @@ import (
 
 	"github.com/gofrs/uuid"
 
+	"database/sql"
+
+	"github.com/pkg/errors"
 	"github.com/pquerna/otp"
 	"github.com/supabase/auth/internal/conf"
+	"github.com/supabase/auth/internal/crypto"
 	"github.com/supabase/auth/internal/models"
+	"github.com/supabase/auth/internal/storage"
 	"github.com/supabase/auth/internal/utilities"
-
-	"github.com/jackc/pgx/v4"
 
 	"github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/require"
@@ -59,7 +61,8 @@ func (ts *MFATestSuite) SetupTest() {
 	require.NoError(ts.T(), err, "Error creating test user model")
 	require.NoError(ts.T(), ts.API.db.Create(u), "Error saving new test user")
 	// Create Factor
-	f := models.NewFactor(u, "test_factor", models.TOTP, models.FactorStateUnverified, "secretkey")
+	f := models.NewFactor(u, "test_factor", models.TOTP, models.FactorStateUnverified)
+	require.NoError(ts.T(), f.SetSecret("secretkey", ts.Config.Security.DBEncryption.Encrypt, ts.Config.Security.DBEncryption.EncryptionKeyID, ts.Config.Security.DBEncryption.EncryptionKey))
 	require.NoError(ts.T(), ts.API.db.Create(f), "Error saving new test factor")
 	// Create corresponding session
 	s, err := models.NewSession(u.ID, &f.ID)
@@ -92,7 +95,9 @@ func (ts *MFATestSuite) SetupTest() {
 }
 
 func (ts *MFATestSuite) generateAAL1Token(user *models.User, sessionId *uuid.UUID) string {
-	token, _, err := ts.API.generateAccessToken(context.Background(), ts.API.db, user, sessionId, models.TOTPSignIn)
+	// Not an actual path. Dummy request to simulate a signup request that we can use in generateAccessToken
+	req := httptest.NewRequest(http.MethodPost, "/factors", nil)
+	token, _, err := ts.API.generateAccessToken(req, ts.API.db, user, sessionId, models.TOTPSignIn)
 	require.NoError(ts.T(), err, "Error generating access token")
 	return token
 }
@@ -143,7 +148,7 @@ func (ts *MFATestSuite) TestEnrollFactor() {
 		ts.Run(c.desc, func() {
 			w := performEnrollFlow(ts, token, c.friendlyName, c.factorType, c.issuer, c.expectedCode)
 
-			factors, err := models.FindFactorsByUser(ts.API.db, ts.TestUser)
+			factors, err := FindFactorsByUser(ts.API.db, ts.TestUser)
 			ts.Require().NoError(err)
 			addedFactor := factors[len(factors)-1]
 			require.False(ts.T(), addedFactor.IsVerified())
@@ -194,7 +199,7 @@ func (ts *MFATestSuite) TestMultipleEnrollsCleanupExpiredFactors() {
 	}
 
 	// All Factors except last factor should be expired
-	factors, err := models.FindFactorsByUser(ts.API.db, ts.TestUser)
+	factors, err := FindFactorsByUser(ts.API.db, ts.TestUser)
 	require.NoError(ts.T(), err)
 
 	// Make a challenge so last, unverified factor isn't deleted on next enroll (Factor 2)
@@ -202,7 +207,7 @@ func (ts *MFATestSuite) TestMultipleEnrollsCleanupExpiredFactors() {
 
 	// Enroll another Factor (Factor 3)
 	_ = performEnrollFlow(ts, token, "", models.TOTP, "https://issuer.com", http.StatusOK)
-	factors, err = models.FindFactorsByUser(ts.API.db, ts.TestUser)
+	factors, err = FindFactorsByUser(ts.API.db, ts.TestUser)
 	require.NoError(ts.T(), err)
 	require.Equal(ts.T(), 3, len(factors))
 }
@@ -248,7 +253,7 @@ func (ts *MFATestSuite) TestMFAVerifyFactor() {
 			require.NoError(ts.T(), err)
 
 			sharedSecret := ts.TestOTPKey.Secret()
-			factors, err := models.FindFactorsByUser(ts.API.db, ts.TestUser)
+			factors, err := FindFactorsByUser(ts.API.db, ts.TestUser)
 			f := factors[0]
 			f.Secret = sharedSecret
 			require.NoError(ts.T(), err)
@@ -319,17 +324,17 @@ func (ts *MFATestSuite) TestUnenrollVerifiedFactor() {
 	for _, v := range cases {
 		ts.Run(v.desc, func() {
 			var buffer bytes.Buffer
-			if v.isAAL2 {
-				ts.TestSession.UpdateAssociatedAAL(ts.API.db, models.AAL2.String())
-			}
+
 			// Create Session to test behaviour which downgrades other sessions
-			factors, err := models.FindFactorsByUser(ts.API.db, ts.TestUser)
+			factors, err := FindFactorsByUser(ts.API.db, ts.TestUser)
 			require.NoError(ts.T(), err, "error finding factors")
 			f := factors[0]
 			f.Secret = ts.TestOTPKey.Secret()
 			require.NoError(ts.T(), f.UpdateStatus(ts.API.db, models.FactorStateVerified))
 			require.NoError(ts.T(), ts.API.db.Update(f), "Error updating new test factor")
-
+			if v.isAAL2 {
+				ts.TestSession.UpdateAALAndAssociatedFactor(ts.API.db, models.AAL2, &f.ID)
+			}
 			token := ts.generateAAL1Token(ts.TestUser, &ts.TestSession.ID)
 			w := ServeAuthenticatedRequest(ts, http.MethodDelete, fmt.Sprintf("/factors/%s", f.ID), token, buffer)
 			require.Equal(ts.T(), v.expectedHTTPCode, w.Code)
@@ -477,14 +482,19 @@ func ServeAuthenticatedRequest(ts *MFATestSuite, method, path, token string, buf
 func performVerifyFlow(ts *MFATestSuite, challengeID, factorID uuid.UUID, token string, requireStatusOK bool) *httptest.ResponseRecorder {
 	var buffer bytes.Buffer
 
-	conn, err := pgx.Connect(context.Background(), ts.API.db.URL())
+	factor, err := models.FindFactorByFactorID(ts.API.db, factorID)
 	require.NoError(ts.T(), err)
+	require.NotNil(ts.T(), factor)
 
-	defer conn.Close(context.Background())
+	totpSecret := factor.Secret
 
-	var totpSecret string
-	err = conn.QueryRow(context.Background(), "select secret from mfa_factors where id=$1", factorID).Scan(&totpSecret)
-	require.NoError(ts.T(), err)
+	if es := crypto.ParseEncryptedString(factor.Secret); es != nil {
+		secret, err := es.Decrypt(factor.ID.String(), ts.API.config.Security.DBEncryption.DecryptionKeys)
+		require.NoError(ts.T(), err)
+		require.NotNil(ts.T(), secret)
+
+		totpSecret = string(secret)
+	}
 
 	code, err := totp.GenerateCode(totpSecret, time.Now().UTC())
 	require.NoError(ts.T(), err)
@@ -658,4 +668,16 @@ func cleanupHook(ts *MFATestSuite, hookName string) {
 	cleanupHookSQL := fmt.Sprintf("drop function if exists %s", hookName)
 	err := ts.API.db.RawQuery(cleanupHookSQL).Exec()
 	require.NoError(ts.T(), err)
+}
+
+// FindFactorsByUser returns all factors belonging to a user ordered by timestamp. Don't use this outside of tests.
+func FindFactorsByUser(tx *storage.Connection, user *models.User) ([]*models.Factor, error) {
+	factors := []*models.Factor{}
+	if err := tx.Q().Where("user_id = ?", user.ID).Order("created_at asc").All(&factors); err != nil {
+		if errors.Cause(err) == sql.ErrNoRows {
+			return factors, nil
+		}
+		return nil, errors.Wrap(err, "Database error when finding MFA factors associated to user")
+	}
+	return factors, nil
 }

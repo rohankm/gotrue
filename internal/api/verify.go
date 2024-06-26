@@ -14,6 +14,7 @@ import (
 	"github.com/supabase/auth/internal/api/provider"
 	"github.com/supabase/auth/internal/api/sms_provider"
 	"github.com/supabase/auth/internal/crypto"
+	mail "github.com/supabase/auth/internal/mailer"
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/observability"
 	"github.com/supabase/auth/internal/storage"
@@ -21,15 +22,9 @@ import (
 )
 
 const (
-	signupVerification      = "signup"
-	recoveryVerification    = "recovery"
-	inviteVerification      = "invite"
-	magicLinkVerification   = "magiclink"
-	emailChangeVerification = "email_change"
 	smsVerification         = "sms"
 	phoneChangeVerification = "phone_change"
 	// includes signupVerification and magicLinkVerification
-	emailOTPVerification = "email"
 )
 
 const (
@@ -130,6 +125,7 @@ func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyPa
 		err         error
 		token       *AccessTokenResponse
 		authCode    string
+		rurl        string
 	)
 
 	grantParams.FillGrantParams(r)
@@ -143,6 +139,7 @@ func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyPa
 			return err
 		}
 	}
+
 	err = db.Transaction(func(tx *storage.Connection) error {
 		var terr error
 		user, terr = a.verifyTokenHash(tx, params)
@@ -150,19 +147,18 @@ func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyPa
 			return terr
 		}
 		switch params.Type {
-		case signupVerification, inviteVerification:
+		case mail.SignupVerification, mail.InviteVerification:
 			user, terr = a.signupVerify(r, ctx, tx, user)
-		case recoveryVerification, magicLinkVerification:
+		case mail.RecoveryVerification, mail.MagicLinkVerification:
 			user, terr = a.recoverVerify(r, tx, user)
-		case emailChangeVerification:
+		case mail.EmailChangeVerification:
 			user, terr = a.emailChangeVerify(r, tx, params, user)
 			if user == nil && terr == nil {
-				// when double confirmation is required
-				rurl, err := a.prepRedirectURL(singleConfirmationAccepted, params.RedirectTo, flowType)
-				if err != nil {
-					return err
+				// only one OTP is confirmed at this point, so we return early and ask the user to confirm the second OTP
+				rurl, terr = a.prepRedirectURL(singleConfirmationAccepted, params.RedirectTo, flowType)
+				if terr != nil {
+					return terr
 				}
-				http.Redirect(w, r, rurl, http.StatusSeeOther)
 				return nil
 			}
 		default:
@@ -184,7 +180,7 @@ func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyPa
 		}
 
 		if isImplicitFlow(flowType) {
-			token, terr = a.issueRefreshToken(ctx, tx, user, models.OTP, grantParams)
+			token, terr = a.issueRefreshToken(r, tx, user, models.OTP, grantParams)
 			if terr != nil {
 				return terr
 			}
@@ -203,15 +199,17 @@ func (a *API) verifyGet(w http.ResponseWriter, r *http.Request, params *VerifyPa
 	if err != nil {
 		var herr *HTTPError
 		if errors.As(err, &herr) {
-			rurl, err := a.prepErrorRedirectURL(herr, r, params.RedirectTo, flowType)
+			rurl, err = a.prepErrorRedirectURL(herr, r, params.RedirectTo, flowType)
 			if err != nil {
 				return err
 			}
-			http.Redirect(w, r, rurl, http.StatusSeeOther)
-			return nil
 		}
 	}
-	rurl := params.RedirectTo
+	if rurl != "" {
+		http.Redirect(w, r, rurl, http.StatusSeeOther)
+		return nil
+	}
+	rurl = params.RedirectTo
 	if isImplicitFlow(flowType) && token != nil {
 		q := url.Values{}
 		q.Set("type", params.Type)
@@ -254,11 +252,11 @@ func (a *API) verifyPost(w http.ResponseWriter, r *http.Request, params *VerifyP
 		}
 
 		switch params.Type {
-		case signupVerification, inviteVerification:
+		case mail.SignupVerification, mail.InviteVerification:
 			user, terr = a.signupVerify(r, ctx, tx, user)
-		case recoveryVerification, magicLinkVerification:
+		case mail.RecoveryVerification, mail.MagicLinkVerification:
 			user, terr = a.recoverVerify(r, tx, user)
-		case emailChangeVerification:
+		case mail.EmailChangeVerification:
 			user, terr = a.emailChangeVerify(r, tx, params, user)
 			if user == nil && terr == nil {
 				isSingleConfirmationResponse = true
@@ -283,7 +281,7 @@ func (a *API) verifyPost(w http.ResponseWriter, r *http.Request, params *VerifyP
 		if terr := tx.Reload(user); terr != nil {
 			return terr
 		}
-		token, terr = a.issueRefreshToken(ctx, tx, user, models.OTP, grantParams)
+		token, terr = a.issueRefreshToken(r, tx, user, models.OTP, grantParams)
 		if terr != nil {
 			return terr
 		}
@@ -306,6 +304,8 @@ func (a *API) verifyPost(w http.ResponseWriter, r *http.Request, params *VerifyP
 }
 
 func (a *API) signupVerify(r *http.Request, ctx context.Context, conn *storage.Connection, user *models.User) (*models.User, error) {
+	config := a.config
+
 	if user.EncryptedPassword == "" && user.InvitedAt != nil {
 		// sign them up with temporary password, and require application
 		// to present the user with a password set form
@@ -315,7 +315,7 @@ func (a *API) signupVerify(r *http.Request, ctx context.Context, conn *storage.C
 			panic(err)
 		}
 
-		if err := user.SetPassword(ctx, password); err != nil {
+		if err := user.SetPassword(ctx, password, config.Security.DBEncryption.Encrypt, config.Security.DBEncryption.EncryptionKeyID, config.Security.DBEncryption.EncryptionKey); err != nil {
 			return nil, err
 		}
 	}
@@ -411,6 +411,13 @@ func (a *API) smsVerify(r *http.Request, conn *storage.Connection, user *models.
 			}
 		}
 
+		if user.IsAnonymous {
+			user.IsAnonymous = false
+			if terr := tx.UpdateOnly(user, "is_anonymous"); terr != nil {
+				return terr
+			}
+		}
+
 		if terr := tx.Load(user, "Identities"); terr != nil {
 			return internalServerError("Error refetching identities").WithInternalError(terr)
 		}
@@ -431,8 +438,8 @@ func (a *API) prepErrorRedirectURL(err *HTTPError, r *http.Request, rurl string,
 
 	// Maintain separate query params for hash and query
 	hq := url.Values{}
-	log := observability.GetLogEntry(r)
-	errorID := getRequestID(r.Context())
+	log := observability.GetLogEntry(r).Entry
+	errorID := utilities.GetRequestID(r.Context())
 	err.ErrorID = errorID
 	log.WithError(err.Cause()).Info(err.Error())
 	if str, ok := oauthErrorMap[err.HTTPStatus]; ok {
@@ -484,11 +491,28 @@ func (a *API) emailChangeVerify(r *http.Request, conn *storage.Connection, param
 	config := a.config
 	if config.Mailer.SecureEmailChangeEnabled && user.EmailChangeConfirmStatus == zeroConfirmation && user.GetEmail() != "" {
 		err := conn.Transaction(func(tx *storage.Connection) error {
+			currentOTT, terr := models.FindOneTimeToken(tx, params.TokenHash, models.EmailChangeTokenCurrent)
+			if terr != nil && !models.IsNotFoundError(terr) {
+				return terr
+			}
+
+			newOTT, terr := models.FindOneTimeToken(tx, params.TokenHash, models.EmailChangeTokenNew)
+			if terr != nil && !models.IsNotFoundError(terr) {
+				return terr
+			}
+
 			user.EmailChangeConfirmStatus = singleConfirmation
-			if params.Token == user.EmailChangeTokenCurrent || params.TokenHash == user.EmailChangeTokenCurrent {
+
+			if params.Token == user.EmailChangeTokenCurrent || params.TokenHash == user.EmailChangeTokenCurrent || (currentOTT != nil && params.TokenHash == currentOTT.TokenHash) {
 				user.EmailChangeTokenCurrent = ""
-			} else if params.Token == user.EmailChangeTokenNew || params.TokenHash == user.EmailChangeTokenNew {
+				if terr := models.ClearOneTimeTokenForUser(tx, user.ID, models.EmailChangeTokenCurrent); terr != nil {
+					return terr
+				}
+			} else if params.Token == user.EmailChangeTokenNew || params.TokenHash == user.EmailChangeTokenNew || (newOTT != nil && params.TokenHash == newOTT.TokenHash) {
 				user.EmailChangeTokenNew = ""
+				if terr := models.ClearOneTimeTokenForUser(tx, user.ID, models.EmailChangeTokenNew); terr != nil {
+					return terr
+				}
 			}
 			if terr := tx.UpdateOnly(user, "email_change_confirm_status", "email_change_token_current", "email_change_token_new"); terr != nil {
 				return terr
@@ -555,14 +579,14 @@ func (a *API) verifyTokenHash(conn *storage.Connection, params *VerifyParams) (*
 	var user *models.User
 	var err error
 	switch params.Type {
-	case emailOTPVerification:
+	case mail.EmailOTPVerification:
 		// need to find user by confirmation token or recovery token with the token hash
 		user, err = models.FindUserByConfirmationOrRecoveryToken(conn, params.TokenHash)
-	case signupVerification, inviteVerification:
+	case mail.SignupVerification, mail.InviteVerification:
 		user, err = models.FindUserByConfirmationToken(conn, params.TokenHash)
-	case recoveryVerification, magicLinkVerification:
+	case mail.RecoveryVerification, mail.MagicLinkVerification:
 		user, err = models.FindUserByRecoveryToken(conn, params.TokenHash)
-	case emailChangeVerification:
+	case mail.EmailChangeVerification:
 		user, err = models.FindUserByEmailChangeToken(conn, params.TokenHash)
 	default:
 		return nil, badRequestError(ErrorCodeValidationFailed, "Invalid email verification type")
@@ -581,7 +605,7 @@ func (a *API) verifyTokenHash(conn *storage.Connection, params *VerifyParams) (*
 
 	var isExpired bool
 	switch params.Type {
-	case emailOTPVerification:
+	case mail.EmailOTPVerification:
 		sentAt := user.ConfirmationSentAt
 		params.Type = "signup"
 		if user.RecoveryToken == params.TokenHash {
@@ -589,11 +613,11 @@ func (a *API) verifyTokenHash(conn *storage.Connection, params *VerifyParams) (*
 			params.Type = "magiclink"
 		}
 		isExpired = isOtpExpired(sentAt, config.Mailer.OtpExp)
-	case signupVerification, inviteVerification:
+	case mail.SignupVerification, mail.InviteVerification:
 		isExpired = isOtpExpired(user.ConfirmationSentAt, config.Mailer.OtpExp)
-	case recoveryVerification, magicLinkVerification:
+	case mail.RecoveryVerification, mail.MagicLinkVerification:
 		isExpired = isOtpExpired(user.RecoverySentAt, config.Mailer.OtpExp)
-	case emailChangeVerification:
+	case mail.EmailChangeVerification:
 		isExpired = isOtpExpired(user.EmailChangeSentAt, config.Mailer.OtpExp)
 	}
 
@@ -617,7 +641,7 @@ func (a *API) verifyUserAndToken(conn *storage.Connection, params *VerifyParams,
 		user, err = models.FindUserByPhoneChangeAndAudience(conn, params.Phone, aud)
 	case smsVerification:
 		user, err = models.FindUserByPhoneAndAudience(conn, params.Phone, aud)
-	case emailChangeVerification:
+	case mail.EmailChangeVerification:
 		// Since the email change could be trigger via the implicit or PKCE flow,
 		// the query used has to also check if the token saved in the db contains the pkce_ prefix
 		user, err = models.FindUserForEmailChange(conn, params.Email, tokenHash, aud, config.Mailer.SecureEmailChangeEnabled)
@@ -640,22 +664,22 @@ func (a *API) verifyUserAndToken(conn *storage.Connection, params *VerifyParams,
 
 	smsProvider, _ := sms_provider.GetSmsProvider(*config)
 	switch params.Type {
-	case emailOTPVerification:
+	case mail.EmailOTPVerification:
 		// if the type is emailOTPVerification, we'll check both the confirmation_token and recovery_token columns
 		if isOtpValid(tokenHash, user.ConfirmationToken, user.ConfirmationSentAt, config.Mailer.OtpExp) {
 			isValid = true
-			params.Type = signupVerification
+			params.Type = mail.SignupVerification
 		} else if isOtpValid(tokenHash, user.RecoveryToken, user.RecoverySentAt, config.Mailer.OtpExp) {
 			isValid = true
-			params.Type = magicLinkVerification
+			params.Type = mail.MagicLinkVerification
 		} else {
 			isValid = false
 		}
-	case signupVerification, inviteVerification:
+	case mail.SignupVerification, mail.InviteVerification:
 		isValid = isOtpValid(tokenHash, user.ConfirmationToken, user.ConfirmationSentAt, config.Mailer.OtpExp)
-	case recoveryVerification, magicLinkVerification:
+	case mail.RecoveryVerification, mail.MagicLinkVerification:
 		isValid = isOtpValid(tokenHash, user.RecoveryToken, user.RecoverySentAt, config.Mailer.OtpExp)
-	case emailChangeVerification:
+	case mail.EmailChangeVerification:
 		isValid = isOtpValid(tokenHash, user.EmailChangeTokenCurrent, user.EmailChangeSentAt, config.Mailer.OtpExp) ||
 			isOtpValid(tokenHash, user.EmailChangeTokenNew, user.EmailChangeSentAt, config.Mailer.OtpExp)
 	case phoneChangeVerification, smsVerification:
